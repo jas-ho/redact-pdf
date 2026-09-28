@@ -1,0 +1,2027 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "docling>=2.0",
+#   "gliner>=0.2.13",
+#   "torch",
+#   "transformers",
+#   "typer>=0.12",
+# ]
+# ///
+"""Redact PII from PDFs into Markdown.
+
+Pipeline (per file):
+  1. Convert PDF → Docling document.
+  2. Per-text-item: collect spans from regex pre-patterns + GLiNER over the
+     ORIGINAL text; resolve overlaps with span-splitting (no whitespace-search,
+     no dropped non-overlapping pieces); apply replacements end-to-start.
+  3. Render markdown via `doc.export_to_markdown()`.
+  4. Post-pass over the rendered markdown: re-run regex pre-patterns (catches
+     IDs in Docling-synthesized links/annotations the redactor never saw) AND
+     sweep for literal recurrences of every entity_map key (catches names that
+     appear elsewhere in the doc but GLiNER missed on the second occurrence).
+  5. Write `<stem>.md` (0644) next to the input PDF, plus a dot-prefixed
+     sibling `.<stem>.entity_map.json` (0600) holding the original surfaces
+     for any de-anonymization. Override location with `--out-dir`.
+
+LANGUAGES
+  Selftest + real documents:         DE, EN (author's private corpus)
+  Selftest only:                     FR, ES
+  Regex anchors only, no selftest:   IT, PT
+  Other:                             GLiNER still handles names/emails/IBANs
+                                     language-agnostically, but the
+                                     language-specific regex anchors (DOB
+                                     labels, role nouns, customer-ID labels)
+                                     won't fire. A WARN is emitted if the
+                                     detected language falls outside the
+                                     supported set.
+
+────────────────────────────────────────────────────────────────────────────
+NOTE TO AGENTS / LLMs (consumer mode)
+  This tool exists so the original PDF stays away from the LLM. If you are
+  an agent using the redacted output for downstream work (analysis,
+  summarization, comparison, drafting):
+    1. Run this tool first.
+    2. Read ONLY the resulting `<stem>.md`.
+    3. Do NOT open the source `.pdf` (Read tool, pdftotext, OCR, etc.).
+    4. Do NOT read the `.<stem>.entity_map.json` sibling: it contains the
+       original surfaces and re-identifies the document.
+
+  Auditor / debugger mode: if you are working ON this redactor itself
+  (verifying false negatives, tuning thresholds, adding rules), you DO need
+  to read source PDFs to compare against output. Do that on a workspace
+  not shared with other agents.
+────────────────────────────────────────────────────────────────────────────
+
+USAGE
+  redact-pdf input.pdf                          # → ./input.md (next to PDF)
+  redact-pdf *.pdf -j 4                         # batch, 4 parallel workers
+  redact-pdf input.pdf -o ~/redacted            # explicit output dir
+  redact-pdf input.pdf --strict                 # also redact orgs/URLs/BIC/VAT
+  redact-pdf input.pdf --rename ask             # prompt for clean output name
+  redact-pdf input.pdf --rename "vertrag-2026"  # explicit output stem
+  redact-pdf input.pdf --json                   # machine-readable result lines
+  redact-pdf --selftest                         # built-in correctness check
+
+FILENAME PII
+  If the input filename contains PII (a name, address, structured ID, …) it
+  leaks into the output filename. Default is `--rename keep` (use slug of
+  stem) + a WARN line on stderr. Override with:
+    --rename keep        # slug of input stem (default; warn on PII)
+    --rename auto        # derive from doc title/heading; fallback to content hash
+    --rename ask         # interactive prompt (TTY only)
+    --rename NAME        # explicit stem (single file only)
+    --rename hash        # 8-char hash of file CONTENT (anonymous, deterministic)
+
+EXIT CODES
+  0  all files ok
+  2  bad invocation (Typer default)
+  3  one or more files failed (incl. redaction errors: output suppressed)
+  4  no input files found
+  5  selftest failure
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from enum import Enum
+from pathlib import Path
+from typing import Dict, List, NamedTuple, Optional, Tuple
+
+# ── silence noisy imports BEFORE they happen ─────────────────────────────
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+logging.basicConfig(level=logging.WARNING, format="%(message)s", stream=sys.stderr)
+for noisy in ("RapidOCR", "docling", "transformers", "urllib3", "huggingface_hub"):
+    logging.getLogger(noisy).setLevel(logging.ERROR)
+
+import typer  # noqa: E402
+
+GLINER_MODEL = "urchade/gliner_multi_pii-v1"
+DEFAULT_THRESHOLD = 0.5
+# Higher thresholds for labels where the model over-fires on German common
+# nouns (Eigentümer/Verbraucher/Erwerber/…). The orthographic capitalization
+# signal that distinguishes proper nouns from common nouns in English is
+# meaningless in German (every noun is capitalized), so GLiNER relies on
+# semantic cues and frequently labels role-nouns as `person`/`organization`.
+# Bumping the score floor for these labels filters low-confidence FPs
+# without affecting confident hits.
+PER_LABEL_THRESHOLDS: Dict[str, float] = {
+    "person": 0.65,
+    "company": 0.65,
+    "organization": 0.65,
+}
+MIN_SURFACE_LEN = 4
+MIN_PERSON_SURFACE = 4
+# Alias compound (hyphenated) surnames ≥ this length to existing placeholders.
+ALIAS_COMPOUND_MIN_LEN = 5
+# Alias long single-token surnames ≥ this length (avoids collision with
+# common first names like "Anna").
+ALIAS_SINGLE_MIN_LEN = 8
+# Phone regex digit-profile rejection thresholds.
+PHONE_ZERO_RATIO = 0.7
+
+# GLiNER labels are split into two tiers:
+#   • LABELS_CORE: clear personal PII; always redacted.
+#   • LABELS_STRICT_EXTRA: context-dependent (org names, country, URLs).
+#     Default = preserved. Re-enabled via --strict.
+LABELS_CORE = [
+    "person",
+    "full address", "street address", "city",
+    "email", "phone number", "date of birth",
+    "IBAN", "bank account number", "credit card number",
+    "passport number", "driver licence",
+]
+LABELS_STRICT_EXTRA = [
+    "company", "organization", "country", "url",
+]
+
+
+def labels_for(strict: bool) -> List[str]:
+    return LABELS_CORE + (LABELS_STRICT_EXTRA if strict else [])
+
+
+# Convenience: module-level default used by selftest and tooling.
+LABELS = LABELS_CORE
+
+# Common short function words across the languages we target. Used to filter
+# GLiNER hallucinations on bare common tokens. Set semantics dedupe overlaps
+# (e.g. "para" appears in ES and PT).
+# Per-language stopword sets. Used (a) at the GLiNER hit level to reject
+# bare common-word hallucinations and (b) for cheap language detection
+# (see detect_language). Adding a language here automatically extends both.
+_STOPWORDS_BY_LANG: Dict[str, set] = {
+    "en": set(
+        "a an and as at by for in is it of on or our the this that to us we "
+        "you your".split()
+    ),
+    "de": set(
+        "am auch auf das dem den der des die ein eine es für frau herr im "
+        "ihr ihm ihnen ihre ihrem ihren ihres mit nicht noch nur sie uns "
+        "und voll von wir zu".split()
+    ),
+    "fr": set(
+        "au aux ce ces de des du en et il ils la le les leur leurs nous sa "
+        "ses son un une vous".split()
+    ),
+    "es": set(
+        "a con cuyo el este esta los las no nos para por que se su sus y o".split()
+    ),
+    "it": set("che con da di gli il i la le lo ma per".split()),
+    "pt": set(
+        "as com da do dos em o os para por que não uma um se é mais no "
+        "na nos nas mas também".split()
+    ),
+    # NL is NOT in SUPPORTED_LANGS: included here as a detection "decoy".
+    # Without it, Dutch text (which shares `de`, `des`, `en` with French)
+    # gets confidently misclassified as FR and no language WARN fires. With
+    # NL competing, Dutch wins → WARN fires → user knows regex anchors
+    # won't apply.
+    "nl": set(
+        "de het een van en is dat niet voor met op te zijn worden "
+        "naar of als bij hij zij".split()
+    ),
+}
+STOPWORDS: set = set().union(*_STOPWORDS_BY_LANG.values())
+
+# Language support tiers. `de` and `en` are covered by the selftest and were
+# checked against a private corpus of real documents; `fr` and `es` have
+# selftest cases; `it` and `pt` only have regex anchors (DOB labels,
+# customer-number labels) and no selftest case yet.
+VALIDATED_LANGS = {"de", "en"}
+LIKELY_OK_LANGS = {"fr", "es", "it", "pt"}
+SUPPORTED_LANGS = VALIDATED_LANGS | LIKELY_OK_LANGS
+
+
+def detect_language(text: str) -> Optional[str]:
+    """Cheap stopword-count language detection. Returns one of the keys in
+    `_STOPWORDS_BY_LANG` or None if the text is too short / no language
+    dominates. Zero-dep, ~1ms on typical PDF text."""
+    tokens = re.findall(r"\b[a-zäöüß]{2,}\b", text.lower())
+    if len(tokens) < 50:
+        return None
+    counts = {
+        lang: sum(1 for t in tokens if t in sw)
+        for lang, sw in _STOPWORDS_BY_LANG.items()
+    }
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    best_lang, best_count = ranked[0]
+    second_count = ranked[1][1] if len(ranked) > 1 else 0
+    # Need both a meaningful count AND a clear winner (≥1.5× the runner-up).
+    if best_count < 8 or best_count < 1.5 * max(second_count, 1):
+        return None
+    return best_lang
+
+# Common ISO-3166 alpha-2 codes for BIC/VAT validation. Not exhaustive:
+# expand as needed.
+COUNTRIES = (
+    "AT|BE|BG|CH|CY|CZ|DE|DK|EE|ES|FI|FR|GB|GR|HR|HU|IE|IS|IT|LI|LT|LU|LV|MT|"
+    "NL|NO|PL|PT|RO|SE|SI|SK|US|CA|AU|JP|CN|TR|RU"
+)
+
+PLACEHOLDER_RE = re.compile(r"\[[a-z_]+-\d+\]?")
+
+DATE_SHAPE_RE = re.compile(
+    r"\b(?:"
+    r"\d{1,2}\.\d{1,2}\.\d{2,4}"
+    r"|\d{4}-\d{2}-\d{2}"
+    r"|\d{1,2}/\d{1,2}/\d{2,4}"
+    r"|\d{1,2}\.\d{4}"
+    r"|\d{1,2}/\d{4}"
+    r"|\d{4}\.\d{1,2}\.\d{1,2}"
+    r")\b"
+)
+
+# Markers we use to spot pricing/bracket table months that look like
+# Steuernummer (e.g. `03/2025`).
+MONTH_YEAR_RE = re.compile(r"\b(0?[1-9]|1[0-2])/\d{4}\b")
+
+# Date range without explicit year on each side: e.g. "01.01. - 31.12"
+DATE_RANGE_RE = re.compile(
+    r"\b\d{1,2}\.\d{1,2}\.?\s*[-–]\s*\d{1,2}\.\d{1,2}\.?\b"
+)
+
+# ── Unicode letter classes for European names ────────────────────────────
+# Latin-1 Supplement only. Latin Extended-A (Polish, Czech, etc.) has
+# interleaved upper/lower codepoints that can't be range-separated cleanly,
+# so we exclude it here and rely on GLiNER for those scripts.
+NAME_UPPER = r"A-ZÀ-ÖØ-Þ"
+NAME_LOWER = r"a-zß-öø-ÿ"
+# Name token: starts uppercase, then lowercase/apostrophes/diacritics,
+# optional hyphen-or-apostrophe-then-Uppercase suffix (compound names like
+# Müller-Schmidt, O'Connor).
+NAME_TOKEN = rf"[{NAME_UPPER}][{NAME_LOWER}']*(?:[-'][{NAME_UPPER}][{NAME_LOWER}']*)*"
+
+# ── Multilingual anchor groups ───────────────────────────────────────────
+# Keywords that introduce a date of birth in various languages.
+DOB_ANCHORS = (
+    # `\bgeb\b` anchors on both sides of the abbreviation. The right-side
+    # \b prevents matching `Gebucht`/`Gebühr`/`Gebäude` (both `b` and `u`
+    # are word chars → no boundary), while still allowing `geb`, `geb.`,
+    # `geb:`, `geb am`, `geb. am`.
+    r"\bgeb\b\.?(?:\s*am)?"
+    r"|\bgeboren(?:\s*am)?"
+    r"|\bGeburtsdatum"
+    r"|\bGeb\.?-?\s*Dat(?:um)?"
+    r"|\bborn(?:\s+on)?"
+    r"|\bDOB"
+    r"|\bdate\s+of\s+birth"
+    r"|\bn[ée]{1,2}\s+le"
+    r"|\bnacid[ao]\s+el"
+    r"|\bfecha\s+de\s+nacimiento"
+    r"|\bnat[ao]\s+il"
+    r"|\bdata\s+di\s+nascita"
+    r"|\bnascid[ao]\s+em"
+)
+
+# Maiden / former / "born as" surname anchors. Note we keep `geb.` and
+# `geboren` here because German has the ambiguous overloading (`geb. Schmidt`
+# = "née Schmidt"; `geb. 14.03.1985` = "born 1985"). Disambiguation happens
+# via the value pattern: maiden values are uppercase NAME_TOKENs, DOB values
+# are date shapes, and `reject_regex_match` rejects function-word captures.
+MAIDEN_ANCHORS = (
+    r"\bgeb\."
+    r"|\bgeboren(?:e[rn]?)?\b"       # geboren, geborene, geborener, geborenen
+    r"|\bgeboren\s+als\b"
+    r"|\bn[ée]{1,2}\b"
+    r"|\bborn\s+(?:as|n[ée]e?)\b"
+    r"|\bformerly\s+(?:known\s+)?as\b"
+    r"|\bFKA\b"
+    r"|\bnacid[ao]\s+como\b"
+    r"|\bnat[ao]\s+come\b"
+)
+
+# Account / customer / contract / reference number anchors. The anchor must
+# end at a word boundary (so `Konto` ≠ `Kontoauszug`) and is followed by an
+# explicit separator before the captured value.
+ACCOUNT_ANCHORS = (
+    # DE: accept abbreviated "-Nr.?" AND full "-nummer" forms.
+    r"Kunden(?:-?Nr\.?|nummer)|Vertrags(?:-?Nr\.?|nummer)|"
+    r"Konto(?:-?Nr\.?|nummer|\s+Nr\.?)?|"
+    r"Mandats?-?(?:referenz|nummer)|Mitglieds(?:-?Nr\.?|nummer)|"
+    r"Polizzen(?:-?Nr\.?|nummer)|"
+    r"CreditorID|Order(?:nungs)?-?Nr\.?|Auftrags(?:-?Nr\.?|nummer)|"
+    r"Referenz(?:-?Nr\.?|nummer)|Ticket(?:-?Nr\.?|nummer)|"
+    r"BLZ|VSN|"
+    # EN: require disambiguator like 'no'/'number'/'ID' after short prefixes.
+    r"Account\s+(?:number|no\.?|#|ID)|Acct\.?\s+(?:no\.?|#|ID)|"
+    r"Ref(?:erence)?\.?\s+(?:no\.?|number|#)|"
+    r"Order\s+(?:ID|no\.?|#)|Customer\s+(?:ID|no\.?)|"
+    r"Member\s+(?:ID|no\.?)|Policy\s+(?:no\.?|number)|"
+    # FR: including N° / Nº abbreviations
+    r"Num[ée]ro\s+(?:de\s+)?(?:compte|client|r[ée]f[ée]rence|commande|"
+    r"contrat|police)|"
+    r"N[°ºo]\.?\s+(?:de\s+)?(?:compte|client|r[ée]f[ée]rence)|"
+    # ES
+    r"N[úu]mero\s+(?:de\s+)?(?:cuenta|cliente|referencia|pedido|contrato|"
+    r"p[óo]liza)|"
+    r"N[°ºo]\.?\s+(?:de\s+)?(?:cuenta|cliente)|"
+    # IT
+    r"Numero\s+(?:di\s+)?(?:conto|cliente|riferimento|ordine|contratto|"
+    r"polizza)|"
+    # PT
+    r"N[úu]mero\s+(?:de\s+)?(?:conta|cliente|refer[êe]ncia|pedido|contrato|"
+    r"ap[óo]lice)"
+)
+
+# Structured ID patterns. Each: (label, regex). Capture group convention: if
+# the pattern uses a capture group, ONLY that group is redacted; otherwise
+# the whole match. Surface is validated by `reject_regex_match`.
+PRE_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
+    # Date of birth anchored by a multilingual keyword. Only the date is
+    # redacted, the keyword is preserved.
+    ("date_of_birth", re.compile(
+        rf"(?:(?i:{DOB_ANCHORS}))"
+        r"[:\s.]*(\d{1,2}\.\d{1,2}\.\d{2,4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})"
+    )),
+    # Maiden / former surname after a multilingual "born as" keyword.
+    # Anchors are case-insensitive (scoped (?i:...) inline) but NAME_TOKEN
+    # stays case-SENSITIVE: otherwise lowercase function words like `am`
+    # (DE) or `le` (FR) would match `[A-Z][a-z]+` under global IGNORECASE.
+    ("maiden_name", re.compile(
+        rf"(?:(?i:{MAIDEN_ANCHORS}))\s+({NAME_TOKEN}(?:\s+{NAME_TOKEN}){{0,3}})"
+    )),
+    ("policy_number", re.compile(r"\b\d{3}/\d{6,8}-\d\b")),
+    ("iban", re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){3,7}[ ]?[A-Z0-9]{0,4}\b")),
+    # BIC: 4 alpha + valid country + 2 loc + optional 3 branch.
+    ("bic", re.compile(rf"\b[A-Z]{{4}}(?:{COUNTRIES})[A-Z0-9]{{2}}(?:[A-Z0-9]{{3}})?\b")),
+    # EU VAT IDs: ATU + 8 digits, DE + 9, plus generic country-coded variants.
+    ("vat_id", re.compile(
+        rf"\b(?:ATU\d{{8}}|DE\d{{9}}|(?:{COUNTRIES})\d{{8,12}})(?=\b|\W|$)"
+    )),
+    # German Steuernummer state-format. Require slashes on BOTH sides
+    # (NNNN/NNNNN/NNNNN) to avoid grabbing MM/YYYY pricing brackets.
+    ("tax_number", re.compile(r"\b\d{2,4}/\d{3,5}/\d{4,5}\b")),
+    # Austrian SVNr: 4 digits + valid DDMMYY.
+    ("social_security_number", re.compile(
+        r"\b\d{4}[\s-]?(?:0[1-9]|[12]\d|3[01])(?:0[1-9]|1[0-2])\d{2}\b"
+    )),
+    # German Steuer-ID: 11 digits, digit-only lookarounds (filenames!).
+    ("tax_identification_number", re.compile(r"(?<!\d)\d{11}(?!\d)")),
+    # Long digit IDs (12-32 digits): tickets, mandate refs, customer numbers.
+    ("long_id", re.compile(r"(?<!\d)\d{12,32}(?!\d)")),
+    # DE Personalausweis (T + 9 digits, etc.)
+    ("national_identification_number", re.compile(r"\b[A-Z]\d{8}\b")),
+    # Customer/contract/account numbers explicitly labeled (multilingual).
+    # Anchors are case-insensitive but the captured ID stays case-sensitive
+    # (so we don't match lowercase compound-word fragments). The separator
+    # `[:\s.#]+` is REQUIRED (not optional), preventing `Kontoauszug` from
+    # being treated as `Konto` + `auszug`. The captured value must contain
+    # at least one digit: see reject_regex_match.
+    ("customer_number", re.compile(
+        rf"\b(?:(?i:{ACCOUNT_ANCHORS}))[:\s.#]+([A-Z0-9][A-Z0-9/-]{{4,}})\b"
+    )),
+    ("email", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
+    # HTTP(S) URLs and bare www. URLs. GLiNER's `url` label sometimes misses
+    # these in synthesized markdown links.
+    ("url", re.compile(
+        r"\bhttps?://[^\s)>\"'\]]+|"
+        r"\bwww\.[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s)>\"'\]]*)?"
+    )),
+    ("phone_number", re.compile(
+        r"(?<![\w\d])"
+        r"(?:\+\d{1,3}[\s./()-]*|\b0)"
+        r"\d[\d\s./()-]{6,18}\d"
+        r"(?![\w\d])"
+    )),
+]
+
+
+# ── helpers ───────────────────────────────────────────────────────────────
+
+_ZWS_RE = re.compile(
+    "[­​‌‍⁠﻿]"
+)
+
+
+def normalize_unicode(s: str) -> str:
+    """NFC-normalize and strip zero-width / soft-hyphen chars. Idempotent."""
+    return _ZWS_RE.sub("", unicodedata.normalize("NFC", s))
+
+
+def normalize(s: str) -> str:
+    # NFC + zero-width strip so that entity_map keys and downstream matches
+    # share a canonical form (composed Müller, not decomposed Mu+̈ller).
+    return re.sub(r"\s+", " ", normalize_unicode(s)).strip()
+
+
+# Leading articles across supported languages. The strip is applied ONLY
+# as a normalization before ROLE_NOUN checks: it never affects what we
+# alias or redact, so over-stripping ("Le Pen" → "Pen") cannot cause leaks.
+_ARTICLES_RE = re.compile(
+    r"^\s*(?:"
+    r"der|die|das|den|dem|des|"                # DE definite
+    r"ein|eine|einer|einem|einen|eines|"       # DE indefinite
+    r"the|an?|"                                # EN
+    r"le|la|les|un|une|du|"                    # FR
+    r"el|los|las|unos|unas|"                   # ES (un/una covered by FR)
+    r"il|lo|i|gli|uno|"                        # IT
+    r"o|os|as|um|uma|uns|umas"                 # PT
+    r")\s+",
+    re.IGNORECASE,
+)
+# FR / IT elided articles (l'/d'/un'/qu'). Straight + Unicode apostrophe.
+_APOS_ARTICLE_RE = re.compile(r"^\s*(?:l|d|un|qu)['’]", re.IGNORECASE)
+
+
+def strip_articles(s: str) -> str:
+    """Strip leading articles + zero-width chars + soft hyphens. Used to
+    canonicalize a surface before role-noun comparison. Iterates so that
+    'der die …' (Docling glitches) collapses."""
+    s = normalize_unicode(s)
+    prev = ""
+    while prev != s:
+        prev = s
+        s = _ARTICLES_RE.sub("", s)
+        s = _APOS_ARTICLE_RE.sub("", s)
+    return s.strip()
+
+
+# German/Scandinavian transliterations applied before NFKD so we keep
+# legible filenames (Schäfer → schaefer, not schafer).
+_TRANSLIT = str.maketrans({
+    "ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss",
+    "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
+    "å": "aa", "Å": "Aa", "æ": "ae", "Æ": "Ae",
+    "ø": "oe", "Ø": "Oe",
+})
+
+
+def slug(text: str, max_len: int = 60) -> str:
+    """Filename-safe slug. Transliterates German/Scandinavian diacritics
+    explicitly (ä→ae, ß→ss, …) before NFKD strips the rest."""
+    text = text.translate(_TRANSLIT)
+    text = unicodedata.normalize("NFKD", text)
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
+    return text[:max_len].rstrip("-") or "redacted"
+
+
+def log(tag: str, msg: str, *, json_mode: bool = False, level: str = "INFO") -> None:
+    if json_mode:
+        print(json.dumps({"level": level, "tag": tag, "msg": msg}), file=sys.stderr)
+    else:
+        print(f"{level}[{tag}]: {msg}", file=sys.stderr)
+
+
+def file_content_hash(path: Path, length: int = 8) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()[:length]
+
+
+def atomic_write(path: Path, data: str, *, mode: int = 0o644) -> None:
+    """Atomic write. Refuses to follow symlinks. Verifies target is a regular
+    file after replace (defense against TOCTOU symlink-swap)."""
+    if path.is_symlink():
+        raise OSError(f"refusing to write through symlink: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".redact-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        st = os.lstat(path)
+        from stat import S_ISREG
+        if not S_ISREG(st.st_mode):
+            raise OSError(f"target is not a regular file after write: {path}")
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class RenameMode(str, Enum):
+    keep = "keep"
+    auto = "auto"
+    ask = "ask"
+    hash = "hash"
+
+
+class RedactionError(Exception):
+    """Raised when redaction cannot guarantee a safe output."""
+
+
+class Span(NamedTuple):
+    start: int
+    end: int
+    label: str
+    surface: str
+    source: str   # "regex" or "gliner"
+    score: float
+
+
+# ── span validation ──────────────────────────────────────────────────────
+
+def looks_like_date(s: str) -> bool:
+    return bool(DATE_SHAPE_RE.fullmatch(s.strip()))
+
+
+def looks_like_amount(s: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,3})?", s.strip()))
+
+
+_YEAR_SUFFIX_RE = re.compile(r"\.(19|20)\d{2}\b")
+# OCR garbage heuristic: 4+ consonants without vowel.
+_CONSONANT_RUN_RE = re.compile(r"[bcdfghjklmnpqrstvwxz]{4,}", re.IGNORECASE)
+
+# German/Austrian legal-document role nouns that GLiNER frequently mislabels
+# as `person` / `company` / `organization`. They're not PII and aliasing them
+# destroys document semantics. Lowercase comparison.
+ROLE_NOUNS = {
+    "anwesende", "anwesenden", "beteiligte", "beteiligten",
+    "eigentümer", "eigentümerin", "eigentumer",
+    "schuldner", "schuldnerin",
+    "gläubiger", "glaeubiger", "gläubigerin", "glaeubigerin",
+    "kreditnehmer", "kreditnehmerin",
+    "ehegatte", "ehegattin", "ehepartner",
+    "antragsteller", "antragstellerin",
+    "versicherte", "versicherten", "versicherter",
+    "versicherungsnehmer", "versicherungsnehmerin",
+    "kunde", "kundin", "kunden",
+    "mieter", "mieterin", "vermieter", "vermieterin",
+    "käufer", "kaeufer", "verkäufer", "verkaeufer",
+    "auftraggeber", "auftragnehmer",
+    "begünstigter", "beguenstigter",
+    "bezugsberechtigte", "bezugsberechtigten",
+    "person", "personen", "personenart",
+    "patient", "patientin", "patienten",
+    "zeuge", "zeugin",
+    # FR
+    "client", "cliente", "clients",
+    # ES
+    "cliente", "clientes", "deudor", "acreedor",
+}
+
+# Product/tariff tier nouns Docling tables often contain. GLiNER sometimes
+# tags these as `person` (e.g., "Premium" alone in a cell). Narrow-filtered:
+# only rejected when the surface is a SINGLE token with no title prefix
+# nearby. A real Mr./Frau Klein still gets caught via the multi-token /
+# titled-token paths.
+# Excluded common-surname risks: "klein", "mittel", "groß", "gross",
+# "gold", "silber", "bronze": these are legitimate German surnames; a
+# table cell containing just the surname could leak if we filtered it
+# here. Keep only tier names that are extremely unlikely to be surnames.
+TIER_NOUNS = {
+    "basis", "standard", "premium", "basic", "classic",
+    "platin", "platinum",
+    "komfort", "komfortplus", "komfortpaket", "exklusiv", "exklusivpaket",
+    "economy", "business", "premiumpaket", "basispaket",
+    "aktivplus", "aktivpaket", "starter", "starterpaket",
+}
+
+
+def reject_regex_match(label: str, surface: str) -> bool:
+    surface = surface.strip()
+    if label == "phone_number":
+        if looks_like_date(surface):
+            return True
+        if _YEAR_SUFFIX_RE.search(surface):
+            return True
+        if DATE_RANGE_RE.search(surface):
+            return True
+        digits = re.sub(r"\D", "", surface)
+        if (len(set(digits)) <= 1
+                or digits.count("0") >= max(1, int(len(digits) * PHONE_ZERO_RATIO))):
+            return True
+    if label == "tax_number":
+        # Reject MM/YYYY pricing brackets that match the short form.
+        if MONTH_YEAR_RE.fullmatch(surface):
+            return True
+    if label == "tax_identification_number":
+        digits = surface
+        if len(set(digits)) <= 2:
+            return True
+    if label == "long_id":
+        if len(set(surface)) <= 2:
+            return True
+    if label == "customer_number":
+        # Must contain at least one digit (otherwise it's a word fragment).
+        if not any(c.isdigit() for c in surface):
+            return True
+    return False
+
+
+def reject_gliner_hit(label: str, surface: str) -> bool:
+    surface = surface.strip()
+    if not surface or len(surface) < MIN_SURFACE_LEN:
+        return True
+    if surface.lower() in STOPWORDS:
+        return True
+    if PLACEHOLDER_RE.search(surface):
+        return True
+    if looks_like_amount(surface):
+        return True
+    # Reject date-shaped surfaces ONLY for non-date labels (so DOB still works).
+    if label != "date of birth" and looks_like_date(surface):
+        return True
+    if label == "person" and len(surface) < MIN_PERSON_SURFACE:
+        return True
+    if surface.isupper() and len(surface) < 6 and label in ("person", "company", "organization"):
+        return True
+    # Reject role nouns mislabeled as person/company/organization. These
+    # legal/administrative role words are not PII and aliasing them across
+    # the doc would merge unrelated occurrences into one placeholder.
+    # `strip_articles` covers "die Versicherungsnehmerin" → "Versicherungsnehmerin".
+    if label in ("person", "company", "organization"):
+        canon = strip_articles(surface).lower().strip(".,;:")
+        if canon in ROLE_NOUNS:
+            return True
+        # Multi-token role phrases that the whole-surface check misses, e.g.
+        # "Endnutzer oder Käufer", "dessen Sohn". Only reject if the surface
+        # is PURELY a role/relation phrase: if it also contains a Title-Case
+        # proper-noun-looking token (like "Patient: Dr. Anna Beispiel"), keep
+        # the span so the name gets aliased. Codex P1.
+        all_tokens = [
+            t.strip(".,;:") for t in re.split(r"[\s/()\[\]]+", canon) if t
+        ]
+        if len(all_tokens) >= 2 and any(t in ROLE_NOUNS for t in all_tokens):
+            proper_tokens = [
+                t for t in re.split(r"[\s/()\[\]:,]+", surface) if t
+                and len(t.strip(".")) >= 3
+                and t[0].isupper()
+                and any(c.islower() for c in t)
+                and t.lower().strip(".") not in ROLE_NOUNS
+                and t.lower().strip(".") not in STOPWORDS
+            ]
+            if not proper_tokens:
+                return True
+        # Tariff-tier nouns alone in a cell (no spaces) are almost always
+        # product tiers, not people. Multi-token like "Anna Klein" hits the
+        # alias path, so the surname still gets caught via the title-prefixed
+        # full name elsewhere in the doc.
+        if (label == "person"
+                and " " not in canon
+                and "-" not in canon
+                and canon in TIER_NOUNS):
+            return True
+    # OCR garbage: only reject if the entire surface lacks vowels (German has
+    # long consonant clusters like "Strübel" or "Pfister" that are NOT OCR
+    # garbage). Real garbage strings tend to be all-consonant or near-it.
+    if not re.search(r"[aeiouäöüáéíóúàèìòù]", surface, re.IGNORECASE):
+        if len(surface) >= 6:
+            return True
+    return False
+
+
+def trim_leading_role_prefix(text: str, start: int, end: int) -> Tuple[int, int]:
+    """Advance `start` past leading role-noun tokens followed by punctuation/
+    whitespace. Converts e.g. "Patient: Dr. Anna Beispiel" → "Dr. Anna
+    Beispiel", so the entity_map key is the actual name and `add_name_aliases`
+    can extract the surname properly.
+
+    Pure name spans (no leading role noun) are unaffected. Pure role phrases
+    like "Endnutzer oder Käufer" have no leading role-noun in ROLE_NOUNS so
+    nothing is trimmed; they remain as cosmetic placeholders without leaking.
+    """
+    while start < end:
+        rest = text[start:end]
+        # Either: word + optional whitespace + delimiter + optional whitespace,
+        # or: word + required whitespace (for delimiter-less "Patient Anna…").
+        m = re.match(r"^(\S+?)\s*[:;,]\s*|^(\S+?)\s+", rest)
+        if not m:
+            break
+        word = (m.group(1) or m.group(2) or "").strip(".,;:")
+        if word.lower() not in ROLE_NOUNS:
+            break
+        start += m.end()
+    return start, end
+
+
+# ── core redactor ─────────────────────────────────────────────────────────
+
+# Labels we trust as "strong identifiers": regex match wins over GLiNER.
+STRONG_REGEX_LABELS = {
+    "policy_number", "iban", "bic", "vat_id", "email",
+    "tax_identification_number", "tax_number", "social_security_number",
+    "long_id", "national_identification_number", "customer_number",
+}
+
+# Pre-pattern labels considered "context-dependent": only redacted with
+# --strict. BIC identifies a bank, VAT identifies a company, URLs are
+# usually public references. By default we keep them visible.
+STRICT_ONLY_REGEX_LABELS = {"bic", "vat_id", "url"}
+
+
+class Redactor:
+    def __init__(self, model, labels: List[str], threshold: float, *,
+                 strict: bool = False):
+        self.model = model
+        self.labels = labels
+        self.threshold = threshold
+        self.strict = strict
+        self.entity_map: Dict[str, str] = {}
+        self.counters: Dict[str, int] = {}
+
+    def _label_slug(self, label: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+
+    def _next_id(self, label: str) -> str:
+        key = self._label_slug(label)
+        self.counters[key] = self.counters.get(key, 0) + 1
+        return f"[{key}-{self.counters[key]}]"
+
+    def _collect_regex_spans(self, text: str) -> List[Span]:
+        spans: List[Span] = []
+        for label, pattern in PRE_PATTERNS:
+            if label in STRICT_ONLY_REGEX_LABELS and not self.strict:
+                continue
+            for m in pattern.finditer(text):
+                if m.lastindex:
+                    start, end = m.start(1), m.end(1)
+                else:
+                    start, end = m.start(), m.end()
+                # URL trailing-punctuation trim: ".,;:!?)]" don't belong to URLs.
+                if label == "url":
+                    while end > start and text[end - 1] in ".,;:!?)]>":
+                        end -= 1
+                surface = text[start:end]
+                if not surface or reject_regex_match(label, surface):
+                    continue
+                spans.append(Span(start, end, label, surface, "regex", 1.0))
+        return spans
+
+    def _collect_gliner_spans(self, text: str) -> List[Span]:
+        if not text.strip():
+            return []
+        try:
+            ents = self.model.predict_entities(text, self.labels, threshold=self.threshold)
+        except Exception as exc:
+            raise RedactionError(f"GLiNER prediction failed: {exc}") from exc
+        spans: List[Span] = []
+        for e in ents:
+            start = e.get("start")
+            end = e.get("end")
+            # Validate offsets: model can in principle return garbage.
+            if not isinstance(start, int) or not isinstance(end, int):
+                continue
+            if start < 0 or end <= start or end > len(text):
+                continue
+            surface = text[start:end]  # canonical, ignore e["text"]
+            label = e.get("label", "misc")
+            score = float(e.get("score") or 0.0)
+            # Per-label score floor for labels that the model over-fires on
+            # (see PER_LABEL_THRESHOLDS).
+            min_score = PER_LABEL_THRESHOLDS.get(label, self.threshold)
+            if score < min_score:
+                continue
+            if reject_gliner_hit(label, surface):
+                continue
+            # Trim leading role-noun prefix from person/company/organization
+            # spans so labeled forms like "Patient: Dr. Anna Beispiel" yield
+            # an entity_map key of "Dr. Anna Beispiel": the surname can
+            # then be aliased via the title-prefix path.
+            if label in ("person", "company", "organization"):
+                t_start, t_end = trim_leading_role_prefix(text, start, end)
+                if t_end - t_start >= MIN_SURFACE_LEN:
+                    start, end = t_start, t_end
+                    surface = text[start:end]
+            spans.append(Span(start, end, label, surface, "gliner", score))
+        return spans
+
+    def _resolve_overlaps(self, spans: List[Span]) -> List[Span]:
+        """Resolve overlaps by SPLITTING lower-priority spans around accepted
+        higher-priority spans, not by dropping them outright. This prevents
+        non-overlapping PII (the un-overlapped part of a larger span) from
+        being silently lost."""
+        def priority(s: Span):
+            strong = (s.source == "regex" and s.label in STRONG_REGEX_LABELS)
+            return (1 if strong else 0, s.end - s.start, s.score)
+
+        ranked = sorted(spans, key=lambda s: priority(s), reverse=True)
+        kept: List[Span] = []
+        for span in ranked:
+            pieces = [(span.start, span.end)]
+            for k in kept:
+                next_pieces = []
+                for s, e in pieces:
+                    if k.end <= s or k.start >= e:
+                        next_pieces.append((s, e))
+                    else:
+                        if s < k.start:
+                            next_pieces.append((s, k.start))
+                        if k.end < e:
+                            next_pieces.append((k.end, e))
+                pieces = next_pieces
+            for s, e in pieces:
+                if e - s < MIN_SURFACE_LEN:
+                    continue
+                # Build new span for the piece (surface may differ from original
+                # if it was split). Re-validate as a GLiNER-style hit.
+                # We re-use the original label/source/score.
+                kept.append(Span(s, e, span.label, "", span.source, span.score))
+        # Surfaces will be re-sliced from the original text in `redact`.
+        return kept
+
+    def redact_chunk(self, text: str) -> str:
+        """Redact one text chunk. Raises RedactionError on NER failure."""
+        if not text:
+            return text
+        spans = self._collect_regex_spans(text) + self._collect_gliner_spans(text)
+        spans = self._resolve_overlaps(spans)
+        for span in sorted(spans, key=lambda s: -s.start):
+            surface = text[span.start:span.end]
+            key = normalize(surface)
+            if not key or len(key) < MIN_SURFACE_LEN:
+                continue
+            # Re-validate only GLiNER spans (regex spans went through
+            # reject_regex_match already). After span-splitting a GLiNER hit
+            # may have shrunk into something label-incompatible.
+            if span.source == "gliner" and reject_gliner_hit(span.label, key):
+                continue
+            if key not in self.entity_map:
+                self.entity_map[key] = self._next_id(span.label)
+            text = text[:span.start] + self.entity_map[key] + text[span.end:]
+        return text
+
+    # backward-compat alias
+    redact = redact_chunk
+
+    def apply_pre_patterns_only(self, text: str) -> str:
+        """Regex-only pass (no GLiNER). Used on rendered markdown to catch IDs
+        that appear in Docling-synthesized links/tables the per-item redactor
+        never saw. Same length floor as the chunk pass, to avoid registering
+        tiny captures like `le` or `am` that slip through specific patterns."""
+        spans = self._collect_regex_spans(text)
+        # Resolve overlaps (regex-only: most will be disjoint anyway).
+        spans = self._resolve_overlaps(spans)
+        for span in sorted(spans, key=lambda s: -s.start):
+            surface = text[span.start:span.end]
+            key = normalize(surface)
+            if not key or len(key) < MIN_SURFACE_LEN:
+                continue
+            if key not in self.entity_map:
+                self.entity_map[key] = self._next_id(span.label)
+            text = text[:span.start] + self.entity_map[key] + text[span.end:]
+        return text
+
+    def redact_anchored_table_cells(self, markdown: str) -> str:
+        """Markdown post-pass for tables where an anchor (e.g. `Geburtsdatum`)
+        is in one cell and the value (e.g. `08.05.1985`) is in another cell.
+        The per-item redactor and `apply_pre_patterns_only` regex are
+        single-line and miss this layout. Two patterns covered:
+
+          1. Row-local key-value (2-col):
+                | Geburtsdatum | 08.05.1985 |
+             Anchor in cell 0, value in cell 1.
+
+          2. Column-propagated (header + data rows):
+                | Vorname | Geburtsdatum | Beginn |
+                |---------|--------------|--------|
+                | Anna    | 08.04.1993   | 01.03  |
+             Anchor in header at column 1, values in column 1 of data rows.
+
+        Only DOB is propagated for now: the FP risk on customer_number-
+        style anchors with looser value patterns is higher than the leak
+        risk (those patterns are already caught by the per-cell GLiNER pass
+        plus the regex post-pass since both ends typically appear in one
+        line of the rendered markdown).
+        """
+        # (label, anchor_regex, value_regex)
+        anchors = [
+            ("date_of_birth",
+             re.compile(rf"(?i:{DOB_ANCHORS})"),
+             re.compile(
+                 r"\b\d{1,2}\.\d{1,2}\.\d{2,4}\b"
+                 r"|\b\d{1,2}/\d{1,2}/\d{2,4}\b"
+                 r"|\b\d{4}-\d{2}-\d{2}\b")),
+        ]
+
+        def is_table_row(s: str) -> bool:
+            t = s.strip()
+            return t.startswith("|") and t.count("|") >= 2
+
+        sep_re = re.compile(r"^\s*\|(?:\s*:?-{2,}:?\s*\|)+\s*$")
+
+        def split_cells(s: str) -> Tuple[str, str, List[str]]:
+            t = s
+            # Preserve any leading whitespace before the first `|` so we
+            # can rebuild the line faithfully.
+            lead_ws_len = len(t) - len(t.lstrip())
+            lead = t[:lead_ws_len]
+            body = t[lead_ws_len:]
+            lpipe = "|" if body.startswith("|") else ""
+            if lpipe:
+                body = body[1:]
+            rpipe = "|" if body.endswith("|") else ""
+            if rpipe:
+                body = body[:-1]
+            return lead + lpipe, rpipe, body.split("|")
+
+        def _replace_in_cell(cell: str, value_re, label: str) -> str:
+            def _sub(m):
+                surface = m.group(0)
+                key = normalize(surface)
+                if len(key) < MIN_SURFACE_LEN:
+                    return surface
+                if key not in self.entity_map:
+                    self.entity_map[key] = self._next_id(label)
+                return self.entity_map[key]
+            return value_re.sub(_sub, cell)
+
+        lines = markdown.splitlines()
+        i = 0
+        while i < len(lines):
+            if not is_table_row(lines[i]):
+                i += 1
+                continue
+            lead, rpipe, cells = split_cells(lines[i])
+            # Find anchor-matching cells (column-major map).
+            anchor_cols: Dict[int, Tuple["re.Pattern[str]", str]] = {}
+            for col_idx, cell in enumerate(cells):
+                for label, anchor_re, value_re in anchors:
+                    if anchor_re.search(cell):
+                        anchor_cols[col_idx] = (value_re, label)
+                        break
+            if not anchor_cols:
+                i += 1
+                continue
+            # 1. Row-local: redact value-shaped tokens in OTHER cells.
+            for col_idx in range(len(cells)):
+                if col_idx in anchor_cols:
+                    continue
+                for ac_idx, (value_re, label) in anchor_cols.items():
+                    cells[col_idx] = _replace_in_cell(
+                        cells[col_idx], value_re, label
+                    )
+            lines[i] = lead + "|".join(cells) + rpipe
+            # 2. Column-propagated: only if followed by a separator row
+            #    (otherwise this isn't a "true" header row).
+            if i + 1 < len(lines) and sep_re.match(lines[i + 1]):
+                j = i + 2
+                while j < len(lines) and is_table_row(lines[j]):
+                    lead2, rpipe2, row_cells = split_cells(lines[j])
+                    for col_idx, (value_re, label) in anchor_cols.items():
+                        if col_idx < len(row_cells):
+                            row_cells[col_idx] = _replace_in_cell(
+                                row_cells[col_idx], value_re, label
+                            )
+                    lines[j] = lead2 + "|".join(row_cells) + rpipe2
+                    j += 1
+                i = j
+            else:
+                i += 1
+        return "\n".join(lines)
+
+    def add_name_aliases(self) -> None:
+        """For each `person` entity in the map, register a compound-surname
+        alias pointing to the SAME placeholder, so the recurrence sweep
+        catches bare-surname references GLiNER missed.
+
+        Conservative criteria: every condition below must hold:
+          • Label is `person`.
+          • Original surface has a stripped title (Dr./Mr./Mag./Dipl./Frau/…)
+            OR is plain Title Case with ≥2 tokens. This filters out
+            single all-caps headings and bare role nouns.
+          • No token in the cleaned surface is a known role noun
+            (Eigentümer, Schuldner, Anwesende, …): those are likely
+            GLiNER false-positive labels of legal-document roles.
+          • Last token is either: hyphenated compound (≥5 chars), OR a long
+            single token (≥8 chars) AND the original had a title prefix.
+
+        Collision-safe: aliases that already exist (in entity_map or in this
+        round's `new` dict) are NOT overwritten: first-seen wins."""
+        title_prefix = re.compile(
+            r"^(?:"
+            r"(?:Dr|Mr|Mrs|Ms|Prof(?:essor)?|Sr|Sra|"
+            r"Frau|Herr|Madame|Monsieur|Mlle|M|"
+            r"Sig|Sig\.ra|"
+            r"Mag(?:\.a)?|Dipl(?:\.-Ing)?|Ing|DI|MMag|"
+            r"Univ\.?-?Prof|BSc|MSc|LL\.?M|MBA|PhD)\.?\s+"
+            r")+",
+            re.IGNORECASE,
+        )
+        # role_nouns is the module-level ROLE_NOUNS: same set used to
+        # reject GLiNER hits at the source.
+
+        def is_proper_case_name_token(token: str) -> bool:
+            """Title Case: starts uppercase, has at least one lowercase char.
+            Rejects all-caps tokens like EIGENTÜMER (heading style)."""
+            if not token or not token[0].isupper():
+                return False
+            stripped = token.strip(".,;:")
+            return any(c.islower() for c in stripped)
+
+        new: Dict[str, str] = {}
+        for surface, placeholder in list(self.entity_map.items()):
+            if not placeholder.startswith("[person-"):
+                continue
+            cleaned, n_titles = title_prefix.subn("", surface)
+            cleaned = cleaned.strip()
+            had_title = n_titles > 0
+            tokens = cleaned.split()
+            if len(tokens) < 2:
+                continue
+            # Reject if any token (lowercased, articles stripped) is a known
+            # role noun. The strip_articles covers cases where an article
+            # token slipped in via Docling glitches.
+            if any(strip_articles(t).lower().strip(".,;:") in ROLE_NOUNS
+                   for t in tokens):
+                continue
+            # Require proper Title Case across all tokens: rules out
+            # all-caps headings like "ANWESENDEN" sneaking through.
+            if not all(is_proper_case_name_token(t) for t in tokens):
+                continue
+            last = tokens[-1].strip(".,;:")
+            is_compound = "-" in last and len(last) >= ALIAS_COMPOUND_MIN_LEN
+            is_long_single = (
+                len(last) >= ALIAS_SINGLE_MIN_LEN
+                and last[0].isupper()
+                and had_title           # high-confidence only
+            )
+            if not (is_compound or is_long_single):
+                continue
+            for variant in (last, last.upper()):
+                if not variant:
+                    continue
+                if variant in self.entity_map or variant in new:
+                    continue
+                new[variant] = placeholder
+        self.entity_map.update(new)
+
+    def sweep_recurrences(self, text: str) -> str:
+        """Replace any literal occurrence of a known entity_map key. Word-
+        boundary anchored; longest keys first to avoid `John` clobbering
+        `John Smith`. Skips keys already containing placeholders."""
+        # Sort by length desc; skip placeholder-shaped or pure-digit keys
+        # that the pre-pattern pass will have already covered.
+        keys = [k for k in self.entity_map.keys()
+                if not PLACEHOLDER_RE.search(k) and not k.isdigit()]
+        keys.sort(key=len, reverse=True)
+        for key in keys:
+            if len(key) < MIN_SURFACE_LEN:
+                continue
+            placeholder = self.entity_map[key]
+            prefix = r"\b" if key[0].isalnum() else ""
+            suffix = r"\b" if key[-1].isalnum() else ""
+            try:
+                text = re.sub(prefix + re.escape(key) + suffix, placeholder, text)
+            except re.error:
+                continue
+        # Additionally: sweep pure-digit keys (account/customer numbers) with
+        # digit-only lookarounds so they catch standalone recurrences.
+        digit_keys = [k for k in self.entity_map if k.isdigit() and len(k) >= 6]
+        digit_keys.sort(key=len, reverse=True)
+        for key in digit_keys:
+            placeholder = self.entity_map[key]
+            try:
+                text = re.sub(rf"(?<!\d){re.escape(key)}(?!\d)", placeholder, text)
+            except re.error:
+                continue
+        return text
+
+
+# ── filename PII / naming ─────────────────────────────────────────────────
+
+def filename_has_pii(model, stem: str) -> List[dict]:
+    """Detect PII in a filename via both regex pre-patterns AND GLiNER.
+    Underscores/dashes are treated as separators; dots are preserved so
+    `john.doe@example.com` still matches the email regex."""
+    normalized = re.sub(r"[_\-]+", " ", stem)
+    findings = []
+    for label, pattern in PRE_PATTERNS:
+        for m in pattern.finditer(normalized):
+            findings.append({"label": label, "text": m.group(0), "source": "regex"})
+    try:
+        ner = model.predict_entities(
+            normalized,
+            ["person", "full address", "email", "phone number", "date of birth", "IBAN"],
+            threshold=0.4,
+        )
+        for e in ner:
+            findings.append({"label": e["label"], "text": e.get("text", ""), "source": "gliner"})
+    except Exception as exc:
+        # Don't silently swallow: log so agents can see something went wrong.
+        log("filename-pii-detect", f"GLiNER on filename failed: {exc}", level="WARN")
+    return findings
+
+
+def derive_from_content(doc, redactor: Redactor) -> Optional[str]:
+    from docling_core.types.doc import TextItem
+    candidates: List[str] = []
+    for item, _level in doc.iterate_items():
+        if isinstance(item, TextItem) and item.text:
+            label = str(getattr(item, "label", "") or "").lower()
+            if label == "title" and item.text.strip():
+                candidates.insert(0, normalize(item.text))
+                break
+    if not candidates:
+        for item, _level in doc.iterate_items():
+            if isinstance(item, TextItem) and item.text:
+                label = str(getattr(item, "label", "") or "").lower()
+                if label in ("section_header", "heading") and len(item.text.strip()) > 6:
+                    candidates.append(normalize(item.text))
+                if len(candidates) >= 2:
+                    break
+    if not candidates:
+        return None
+    candidate = " ".join(candidates)
+    try:
+        redacted = redactor.redact_chunk(candidate)
+    except RedactionError:
+        return None
+    redacted = re.sub(r"\[[a-z_]+-\d+\]", "", redacted)
+    return slug(redacted) or None
+
+
+def resolve_output_stem(
+    *, original_path: Path, doc, redactor: Redactor, model,
+    rename: str, json_mode: bool,
+) -> Tuple[str, List[dict]]:
+    original_stem = original_path.stem
+    pii = filename_has_pii(model, original_stem)
+
+    if rename not in {m.value for m in RenameMode}:
+        return slug(rename), pii
+
+    mode = RenameMode(rename)
+
+    if mode is RenameMode.keep:
+        if pii:
+            kinds = sorted({f["label"] for f in pii})
+            log("filename-pii",
+                f"input filename contains PII ({', '.join(kinds)}); using slug of original. "
+                f"Override with --rename ask|auto|hash|<name>.",
+                json_mode=json_mode, level="WARN")
+        return slug(original_stem), pii
+
+    if mode is RenameMode.hash:
+        h = file_content_hash(original_path)
+        return f"redacted-{h}", pii
+
+    if mode is RenameMode.auto:
+        derived = derive_from_content(doc, redactor)
+        if derived:
+            return derived, pii
+        log("rename-auto", "no usable title/heading; falling back to content hash",
+            json_mode=json_mode, level="WARN")
+        return f"redacted-{file_content_hash(original_path)}", pii
+
+    if mode is RenameMode.ask:
+        if not sys.stdin.isatty():
+            log("rename-ask",
+                "--rename ask requires a TTY; falling back to --rename keep. "
+                "Use --rename auto|hash|<name> in non-interactive contexts.",
+                json_mode=json_mode, level="ERROR")
+            return slug(original_stem), pii
+        derived = derive_from_content(doc, redactor) or ""
+        print(f"\nInput filename: {original_stem!r}", file=sys.stderr)
+        if pii:
+            kinds = sorted({f["label"] for f in pii})
+            print(f"  ⚠ contains PII: {kinds}", file=sys.stderr)
+        if derived:
+            print(f"  suggested:    {derived!r}", file=sys.stderr)
+        print("  Enter output stem (blank to keep slug of original): ",
+              file=sys.stderr, end="", flush=True)
+        answer = sys.stdin.readline().strip()
+        return slug(answer) if answer else slug(original_stem), pii
+
+    return slug(original_stem), pii
+
+
+# ── per-file pipeline ─────────────────────────────────────────────────────
+
+def extract_pdf_metadata(pdf_path: Path) -> Dict[str, str]:
+    """Read PDF document properties (/Author, /Title, /Subject, /Keywords).
+    These don't appear in the text stream but can leak PII silently if
+    someone opens the file's properties pane. We redact + surface them."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return {}
+    try:
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        try:
+            raw = pdf.get_metadata_dict() or {}
+        finally:
+            pdf.close()
+    except Exception:
+        return {}
+    return {
+        k: v for k, v in raw.items()
+        if v and k in ("Author", "Title", "Subject", "Keywords")
+    }
+
+
+_CLOUD_SYNC_ROOTS = (
+    "Dropbox",
+    "OneDrive",
+    "Google Drive",
+    "GoogleDrive",
+    "iCloud Drive",
+    # macOS iCloud Drive on disk:
+    "Library/Mobile Documents/com~apple~CloudDocs",
+    # macOS-mounted CloudDocs alias:
+    "Library/CloudStorage",
+    "Sync.com",
+    "pCloud Drive",
+    "Box Sync",
+    "Box",
+    "MEGA",
+    "Tresorit",
+)
+
+
+def warn_if_cloud_synced(out_dir: Path, *, json_mode: bool) -> None:
+    """Emit a WARN if `out_dir` looks like it lives under a cloud-sync root.
+    The redacted markdown + entity_map would otherwise be silently uploaded.
+    Detection is path-substring only: false positives are fine (a folder
+    literally named 'Dropbox' under ~/Code is the user's choice to ignore)."""
+    try:
+        resolved = out_dir.resolve()
+    except (OSError, RuntimeError):
+        return
+    s = str(resolved)
+    for root in _CLOUD_SYNC_ROOTS:
+        if f"/{root}/" in s or s.endswith(f"/{root}"):
+            log(
+                "cloud-sync",
+                f"output directory '{resolved}' appears to live under "
+                f"'{root}'. The redacted markdown is safe to sync, but the "
+                "private '.<stem>.entity_map.json' sibling file (0600) "
+                "WILL be uploaded too and contains the original PII. "
+                "NEXT: pass --out-dir pointing outside the synced folder, "
+                "OR exclude '.*.entity_map.json' from sync in the client's "
+                "preferences.",
+                json_mode=json_mode, level="WARN",
+            )
+            return
+
+
+def _build_converter(ocr: bool):
+    """Build a Docling DocumentConverter. OCR off by default (text PDFs only);
+    enable with --ocr for scanned PDFs."""
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    opts = PdfPipelineOptions(do_ocr=ocr)
+    return DocumentConverter(format_options={
+        InputFormat.PDF: PdfFormatOption(pipeline_options=opts)
+    })
+
+
+def process_pdf(
+    pdf_path: Path, out_dir: Path, model, *, rename: str, threshold: float,
+    json_mode: bool, force: bool, strict: bool = False, ocr: bool = False,
+) -> dict:
+    from docling_core.types.doc import TableItem, TextItem
+
+    converter = _build_converter(ocr)
+    result = converter.convert(str(pdf_path))
+    doc = result.document
+    redactor = Redactor(model, labels_for(strict), threshold, strict=strict)
+
+    n_text = n_table = n_chars = 0
+    raw_text_parts: List[str] = []
+    for item, _level in doc.iterate_items():
+        if isinstance(item, TextItem):
+            raw = item.text or ""
+            raw_text_parts.append(raw)
+            new = redactor.redact_chunk(raw)
+            if new != item.text:
+                item.text = new
+            n_text += 1
+            n_chars += len(item.text or "")
+        elif isinstance(item, TableItem):
+            for row in item.data.table_cells:
+                cells = row if isinstance(row, list) else [row]
+                for cell in cells:
+                    if hasattr(cell, "text") and cell.text:
+                        raw_text_parts.append(cell.text)
+                        cell.text = redactor.redact_chunk(cell.text)
+            n_table += 1
+
+    # Language sanity check (stopword-based; zero new deps). WARN if the
+    # detected dominant language is outside the validated/likely-OK set:
+    # GLiNER still handles names/emails/IBANs but regex anchors (DOB labels,
+    # role nouns, customer-number labels) only fire for {DE,EN,FR,ES,IT,PT}.
+    raw_text = " ".join(raw_text_parts)
+    detected = detect_language(raw_text)
+    if detected is None and len(raw_text) > 200:
+        log("language",
+            f"{pdf_path.name}: could not confidently detect language. "
+            "If the doc is in a language outside DE/EN/FR/ES/IT/PT, "
+            "regex anchors (DOB, role nouns, ID labels) may not fire; "
+            "GLiNER still handles names/emails/IBANs.",
+            json_mode=json_mode, level="WARN")
+    elif detected and detected not in SUPPORTED_LANGS:
+        log("language",
+            f"{pdf_path.name}: detected language '{detected}' is outside "
+            "the supported set (DE/EN validated; FR/ES/IT/PT likely OK). "
+            "Regex anchors won't fire for this language; GLiNER still "
+            "handles names/emails/IBANs.",
+            json_mode=json_mode, level="WARN")
+
+    # Heuristic: a text PDF should have ≳ 200 chars per page (a 1-page text
+    # PDF typically holds 500-3000 chars). If it's a lot less and OCR is off,
+    # the input is probably scanned and the user should pass --ocr.
+    n_pages = max(1, len(getattr(doc, "pages", []) or [1]))
+    chars_per_page = n_chars / n_pages
+    if not ocr and chars_per_page < 200 and n_pages >= 1:
+        log("scanned-likely",
+            f"{pdf_path.name}: only {n_chars} chars across {n_pages} page(s) "
+            f"({chars_per_page:.0f} chars/page). Looks like a scanned PDF. "
+            "Re-run with --ocr to extract text from images, "
+            "or pre-process with ocrmypdf for higher quality.",
+            json_mode=json_mode, level="WARN")
+
+    stem, pii = resolve_output_stem(
+        original_path=pdf_path, doc=doc, redactor=redactor, model=model,
+        rename=rename, json_mode=json_mode,
+    )
+
+    md_path = out_dir / f"{stem}.md"
+    # Sibling dot-prefixed secrets file: hidden from `ls`, no subdir clutter,
+    # easy to move/delete alongside the .md. Permissions enforced at file
+    # level (0600) since there's no shared dir to chmod.
+    map_path = out_dir / f".{stem}.entity_map.json"
+
+    if not force:
+        for p in (md_path, map_path):
+            if p.exists():
+                raise RedactionError(
+                    f"output exists: {p}. NEXT: rerun with --force to overwrite, "
+                    f"--rename <NAME> for a different stem, or remove the file."
+                )
+
+    real_out = out_dir.resolve()
+    if not real_out.is_dir():
+        raise RedactionError(f"out_dir does not resolve to a directory: {out_dir}")
+
+    # ── PDF metadata redaction ──────────────────────────────────────────
+    raw_meta = extract_pdf_metadata(pdf_path)
+    redacted_meta: Dict[str, str] = {}
+    for k, v in raw_meta.items():
+        try:
+            redacted_meta[k] = redactor.redact_chunk(v) if v else ""
+        except RedactionError:
+            redacted_meta[k] = "[REDACTED]"
+        if redacted_meta[k] != v:
+            log("metadata-pii",
+                f"{pdf_path.name}: /{k} metadata field contained PII "
+                "(redacted in output; original is in the source PDF "
+                ": use `exiftool -all= file.pdf` to strip).",
+                json_mode=json_mode, level="WARN")
+
+    # ── markdown post-pass ───────────────────────────────────────────────
+    # Catches IDs in Docling-synthesized links/markdown the per-item pass
+    # never saw, plus literal recurrences of names already in entity_map.
+    # Precautionary: blank out Docling's internal name/origin filename fields
+    # before export. They normally aren't included in the markdown output but
+    # could leak the original (potentially PII-bearing) filename if a future
+    # Docling version starts embedding them.
+    try:
+        if hasattr(doc, "name"):
+            doc.name = ""
+        origin = getattr(doc, "origin", None)
+        if origin is not None and hasattr(origin, "filename"):
+            origin.filename = ""
+    except Exception:
+        pass
+
+    markdown = doc.export_to_markdown()
+    # NFC + zero-width strip so entity_map keys (already normalized) match
+    # surfaces in the rendered text and so regex patterns aren't broken by
+    # invisible chars Docling may pass through from the source PDF.
+    markdown = normalize_unicode(markdown)
+    markdown = redactor.apply_pre_patterns_only(markdown)
+    markdown = redactor.redact_anchored_table_cells(markdown)
+    redactor.add_name_aliases()  # alias compound surnames to existing placeholders
+    markdown = redactor.sweep_recurrences(markdown)
+    # Also sweep recurrences through metadata (e.g., aliased compound surnames).
+    redacted_meta = {k: redactor.sweep_recurrences(v) for k, v in redacted_meta.items()}
+
+    # Prepend metadata as YAML frontmatter so the user has a complete view.
+    if redacted_meta:
+        fm_lines = ["---"]
+        for k, v in redacted_meta.items():
+            fm_lines.append(f"{k}: {v}")
+        fm_lines.append("---")
+        markdown = "\n".join(fm_lines) + "\n\n" + markdown
+
+    # Write both files. If the secrets write fails, clean up the markdown
+    # so we don't leave a partial output behind.
+    atomic_write(md_path, markdown, mode=0o644)
+    try:
+        atomic_write(
+            map_path,
+            json.dumps(redactor.entity_map, ensure_ascii=False, indent=2),
+            mode=0o600,
+        )
+    except Exception:
+        try:
+            md_path.unlink()
+        except OSError:
+            pass
+        raise
+
+    return {
+        "input": str(pdf_path),
+        "output": str(md_path),
+        "entity_map": str(map_path),
+        "n_entities": len(redactor.entity_map),
+        "n_text_items": n_text,
+        "n_tables": n_table,
+        "filename_pii": pii,
+    }
+
+
+# ── selftest ──────────────────────────────────────────────────────────────
+
+# Per-language samples and assertions for the built-in correctness check.
+# All data is FICTIONAL: names, IBANs, IDs, and phone numbers are made-up
+# patterns chosen to exercise the pipeline without exposing real PII.
+#   - Names: clearly-fake "Beispiel/Muster/Exemple/Ejemplo" pseudonyms.
+#   - IBANs: synthetic check digits / repeating digits.
+#   - IDs:   `999...` and `99999999` patterns to signal "test data".
+#   - Domains: `example.at|fr|es`: RFC 2606 reserved test domains.
+#   - Companies: TestVersicherung AG, ExempleCorp etc.
+#
+# `must_remove`: substrings that MUST be gone from output (PII caught).
+# `must_keep`:   substrings that MUST remain (false-positive guard).
+# `default_must_keep`: substrings preserved only in default (non-strict) mode.
+# `strict_must_remove`: substrings only redacted in --strict mode.
+SELFTEST_CASES: Dict[str, Dict[str, object]] = {
+    "DE": {
+        "input": (
+            "Versicherung bei der TestVersicherung Österreich AG. "
+            "Patient: Dr. Anna Beispiel, geb. 14.03.1985, "
+            "Polizzen-Nr.: 999/0000001-9, IBAN: AT00 1111 2222 3333 4444, "
+            "BIC: TESTAT22XXX, UID: ATU99999999, "
+            "Tel.: +43 1 999 99 99, Email: anna@example.at, "
+            "wohnhaft in Mödling, Österreich. Vertragsbeginn: 01.05.2026. "
+            "Betrag: 1.234,56 EUR. Berichtszeitraum: 01.2025. "
+            "Bracket: 03/2025. Weitere Infos: www.testversicherung.at/info. "
+            "Wie oben erwähnt, hat Dr. Anna Beispiel zugestimmt. "
+            "Frau Muster-Beispiel, geb. Probe-Schmidt, war Zeugin. "
+            "Mag. Hans Probstmüller hat den Kontoauszug für den Kontoabschluss "
+            "des Quartals geprüft. Geboren am 26.07.1962 in Wien. "
+            "Sehr geehrter Eigentümer, bitte beachten Sie als Eigentümer "
+            "Ihre Pflichten. Die ANWESENDEN bestätigen."
+        ),
+        "must_remove": [
+            # Personal PII: redacted in both modes
+            "Anna", "Beispiel", "14.03.1985", "999/0000001-9",
+            "AT00",
+            "anna@example.at", "+43",
+            "Probe-Schmidt", "Muster-Beispiel",
+            "Probstmüller", "26.07.1962",
+        ],
+        "must_keep": [
+            "01.05.2026", "1.234,56", "01.2025", "03/2025",
+            # Word-internal anchor false-positives that must NOT trigger:
+            "Kontoauszug", "Kontoabschluss",
+            # Function-word capture by maiden-name regex must NOT trigger:
+            " am ",
+            # Role nouns must NOT be aliased away:
+            "Eigentümer", "ANWESENDEN",
+        ],
+        # Default-mode only: these context-dependent identifiers should
+        # remain visible (useful for AI-assisted contract analysis).
+        "default_must_keep": [
+            "TestVersicherung",          # company name
+            "Österreich",                # country
+            "www.testversicherung.at",   # URL
+            "TESTAT22XXX",               # BIC (bank, not user)
+            "ATU99999999",               # VAT ID (company, not user)
+        ],
+    },
+    "EN": {
+        "input": (
+            "Policy holder: Mr. John Example, date of birth 14/03/1985, "
+            "Account number: ACC-99887766, IBAN: GB00 TEST 0000 1111 2222 33, "
+            "Phone: +44 20 7946 0999, email: john.example@example.com. "
+            "Premium: 1,234.56 GBP per year, starting 01/05/2026. "
+            "Ms. Jane Sample-Doe, formerly known as Jane Placeholder, is the "
+            "beneficiary. As agreed, Mr. John Example signed on behalf of "
+            "the customer. The customer confirmed receipt."
+        ),
+        "must_remove": [
+            "John", "Example", "14/03/1985", "ACC-99887766", "GB00",
+            "+44", "john.example@example.com", "Sample-Doe",
+        ],
+        "must_keep": [
+            "1,234.56", "01/05/2026", "The customer confirmed",
+        ],
+    },
+    "FR": {
+        "input": (
+            "Patiente : Dr. Marie Exemple, née le 14/03/1985, "
+            "IBAN: FR00 0000 1111 2222 3333 4444 555, "
+            "Tél : +33 1 99 99 99 99, courriel : marie@example.fr. "
+            "Numéro de compte: 9999999999. "
+            "M. Paul Exemple, né Lévêque-Test, est son père. "
+            "N° de référence: REF-99999. Le client a confirmé."
+        ),
+        "must_remove": [
+            "Marie", "Exemple", "14/03/1985", "FR00",
+            "marie@example.fr", "+33", "9999999999", "Lévêque-Test",
+            "REF-99999",
+        ],
+        "must_keep": [
+            # `le` is a French article: must NOT be captured as a maiden name:
+            " le ",
+        ],
+    },
+    "ES": {
+        "input": (
+            "Paciente: Dr. María Ejemplo, nacida el 14/03/1985, "
+            "IBAN: ES00 0000 1111 2222 3333 4444, "
+            "Tel: +34 600 99 99 99, correo: maria@example.es. "
+            "Número de cuenta: 9999999999. "
+            "Sr. José Ejemplo, nacido como Prueba-Ríos."
+        ),
+        "must_remove": [
+            "María", "Ejemplo", "14/03/1985", "ES00",
+            "maria@example.es", "+34", "9999999999", "Prueba-Ríos",
+        ],
+        "must_keep": [],
+    },
+    # Edge-case probes derived from previously-observed failures.
+    "EDGE": {
+        "input": (
+            # 1. Surname recurrence in different inflections (alias mechanism).
+            "Dr. Anna Probstmüller hat unterschrieben. "
+            "Frau Probstmüller hat zugestimmt. "
+            "Die Mutter PROBSTMÜLLER war Zeugin. "
+            # 2. Date range without years on each side (phone regex must not eat).
+            "Berichtszeitraum: 01.01.2025 - 31.12.2025. "
+            "Subzeitraum: 01.04. - 30.06. "
+            # 3. Austrian SVNr.
+            "Sozialversicherungsnummer: 1234 010180. "
+            # 4. Austrian VAT and BIC together (default-keep both).
+            "UID-Nr.: ATU99999999. BIC: TESTAT22XXX. "
+            # 5. Long ID (ticket / mandate reference).
+            "Ticketnummer: 918273645546372. "
+            # 6. Markdown link URL (default = preserved; --strict = redacted).
+            "Mehr Infos siehe [Datenschutz](https://www.example.org/privacy). "
+            # 7. Trailing URL punctuation should not be part of the URL.
+            "Quelle: www.example.org/info.html. "
+            # 8. Multi-token name with stripped academic title.
+            "Mag. Dipl.-Ing. Karl Testbeispiel ist Auftraggeber. "
+            # 9. Customer/account number behind a label (DE).
+            "Kundennummer: TST-99887766. "
+            # 10. DOB anchor must NOT match `Gebucht`/`Gebühr`/`Gebäude`
+            #     prefixes (financial table over-redaction).
+            "Gebucht am 15.06.2025. Gebühr 12,50. "
+            # 11. DOB anchor MUST match dotless `geb`+space and `geb:`.
+            "Probstmüller geb 26.07.1962 ist hier. Auch geb: 26.07.1962 zählt. "
+            # 12. Label-prefixed name span (codex P1): role-noun + name in
+            #     one span must NOT be rejected wholesale.
+            "Patient: Dr. Felicia Versuchsname war anwesend."
+        ),
+        "must_remove": [
+            "Anna", "Probstmüller", "PROBSTMÜLLER",
+            "1234 010180",                 # SVNr
+            "918273645546372",             # long_id (ticket)
+            "TST-99887766",                # customer_number
+            "26.07.1962",                  # P2: DOB via dotless `geb`
+            # P1 (label + name in one span) covered by reject_cases unit
+            # tests above: GLiNER's behavior on synthetic data is too
+            # variable across label sets to assert end-to-end here.
+        ],
+        "must_keep": [
+            # Phone regex must NOT match the date range
+            "01.01.2025 - 31.12.2025",
+            "01.04. - 30.06.",
+            # DOB anchor must NOT match `Gebucht`/`Gebühr` prefixes.
+            "Gebucht am 15.06.2025",
+            "Gebühr 12,50",
+        ],
+        "default_must_keep": [
+            "ATU99999999",                                # VAT
+            "TESTAT22XXX",                                # BIC
+            "https://www.example.org/privacy",            # URL in markdown link
+            "www.example.org/info.html",                  # bare URL
+            # URL trailing punctuation: period stays in the sentence, not URL.
+            ".html.",
+        ],
+        "strict_must_remove": [
+            "ATU99999999",                                # VAT (redacted strict)
+            "TESTAT22XXX",                                # BIC (redacted strict)
+            "https://www.example.org/privacy",            # URL (redacted strict)
+        ],
+    },
+    # Markdown tables: anchor (e.g. `Geburtsdatum`) and value (a date) in
+    # SEPARATE cells. The per-item GLiNER pass and apply_pre_patterns_only
+    # are single-line: only redact_anchored_table_cells catches these.
+    "TABLES": {
+        "input": (
+            "# Profil\n\n"
+            # 2-col key-value table (row-local case).
+            "| Sozialversicherungsnummer | 1111 010180 |\n"
+            "| Geburtsdatum              | 08.05.1985  |\n"
+            "| Geschlecht                | weiblich    |\n\n"
+            # Wide multi-row table (column-propagated case).
+            "| Versicherte Personen | Geburtsdatum | Beginn     |\n"
+            "|----------------------|--------------|------------|\n"
+            "| Anna Beispiel        | 08.04.1993   | 01.03.2025 |\n"
+            "| Karl Beispiel        | 14.07.1990   | 01.03.2025 |\n\n"
+            # Tariff-tier nouns: TIER_NOUNS filter should keep clearly-not-
+            # surnames visible. (Klein/Gross excluded from TIER_NOUNS: they
+            # are real surnames; we'd rather over-redact than leak surnames.)
+            "| Tarif       | Selbstbehalt |\n"
+            "|-------------|--------------|\n"
+            "| Standard    | 200          |\n"
+            "| Premium     | 500          |\n\n"
+            # Surname-in-cell guard (codex P2): a name table where the
+            # cell value is a common-surname-shaped token must still be
+            # captured as a person, since Klein is a real surname too.
+            "Frau Anna Klein hat den Vertrag unterschrieben."
+            # Article-prefixed role noun (H3): "Die Versicherungsnehmerin" is
+            # NOT a person, should not be aliased.
+            "Die Versicherungsnehmerin bestätigt. Der Versicherungsnehmer "
+            "unterschreibt."
+        ),
+        "must_remove": [
+            "08.05.1985",     # DOB in 2-col table
+            "08.04.1993",     # DOB in wide table, row 1
+            "14.07.1990",     # DOB in wide table, row 2
+            # Surname Klein, in person context with title, MUST be caught.
+            "Anna Klein",
+        ],
+        "must_keep": [
+            # Beginn dates are NOT DOB: they share the table but the
+            # anchor only covers the Geburtsdatum column.
+            "01.03.2025",
+            # Tariff tier nouns: tables, not names.
+            "Standard", "Premium",
+            # Article-prefixed role nouns must not be aliased.
+            "Versicherungsnehmerin", "Versicherungsnehmer",
+        ],
+    },
+}
+
+
+def run_selftest(
+    model, threshold: float, *, json_mode: bool = False, strict: bool = False,
+) -> None:
+    """Run all language samples through the FULL pipeline:
+    per-item redaction → pre-pattern post-pass → name aliasing → recurrence
+    sweep. Same order as `process_pdf`."""
+    failures: List[str] = []
+
+    # Unit-level guards for filtering logic that GLiNER's synthetic-data
+    # behavior is too unreliable to exercise end-to-end. Each entry:
+    #     (label, surface, expected_rejected, why)
+    reject_cases = [
+        # Whole-surface role nouns are rejected (article-stripped).
+        ("person", "Eigentümer", True, "bare role noun"),
+        ("person", "Die Versicherungsnehmerin", True, "article + role noun"),
+        # Multi-token role phrases: both tokens in ROLE_NOUNS.
+        ("person", "Mieter und Vermieter", True, "multi-token: both role nouns"),
+        ("person", "Käufer oder Verkäufer", True, "multi-token: both role nouns"),
+        ("person", "der Antragsteller", True, "article + role noun"),
+        # Codex P1: labeled-name spans must NOT be rejected: the proper-
+        # noun tokens (Anna, Beispiel) survive the role-token check even
+        # though "patient"/"kunde" matches ROLE_NOUNS.
+        ("person", "Patient: Dr. Anna Beispiel", False,
+         "label + name combo: name must survive"),
+        ("person", "Kunde: Maria Muster", False,
+         "label + name combo: name must survive"),
+        # Real multi-token names pass cleanly.
+        ("person", "Anna Beispiel", False, "regular name"),
+        ("person", "Frau Schmidt", False, "title + surname"),
+    ]
+    for label, surface, expect, why in reject_cases:
+        got = reject_gliner_hit(label, surface)
+        if got != expect:
+            failures.append(
+                f"reject_gliner_hit({label!r}, {surface!r}) = {got}, "
+                f"expected {expect} ({why})"
+            )
+
+    # Unit cases for detect_language. The validation set covers the cases
+    # that matter operationally: dominant-language detection for each
+    # supported lang, the NL→fr false-positive that prompted the NL decoy,
+    # and None for too-short / non-Latin inputs.
+    detect_cases = [
+        # (text, expected_lang, why)
+        (
+            "Die Bundesregierung hat ein neues Gesetz vorgelegt. Das Gesetz "
+            "tritt im nächsten Jahr in Kraft. Die Opposition hat den Entwurf "
+            "kritisiert und fordert weitere Anpassungen. Die Abstimmung wird "
+            "voraussichtlich im Dezember stattfinden. Bürger und Unternehmen "
+            "sollen entlastet werden, doch die Finanzierung ist noch unklar. "
+            "Der Bundesrat muss ebenfalls zustimmen, bevor das Gesetz gilt.",
+            "de", "German prose"
+        ),
+        (
+            "The government announced a new framework for the regulation of "
+            "artificial intelligence systems. The proposal would require "
+            "companies to register their models with a central authority. "
+            "Critics argue that the rules are too restrictive and may slow "
+            "down innovation in the sector. Supporters say strong oversight "
+            "is needed to protect consumers from potential harms.",
+            "en", "English prose"
+        ),
+        (
+            "De regering heeft dinsdag een nieuw wettelijk kader "
+            "aangekondigd voor systemen die in kritieke infrastructuur "
+            "worden gebruikt. Het voorstel verplicht bedrijven om hun "
+            "modellen te registreren bij een centrale autoriteit en "
+            "regelmatig audits te ondergaan. Volgens ambtenaren zijn de "
+            "regels bedoeld om consumenten te beschermen en de openbare "
+            "veiligheid te waarborgen. Critici stellen dat de eisen te "
+            "streng zijn en innovatie kunnen vertragen. De minister van "
+            "economische zaken zei dat de wet wordt aangepast als bedrijven "
+            "met goede argumenten komen. Het parlement zal in december "
+            "stemmen over het voorstel, en als het wordt aangenomen treedt "
+            "het volgend jaar in werking. Burgers en bedrijven worden in de "
+            "tussentijd uitgenodigd om hun mening te geven via een online "
+            "consultatieproces dat tot eind oktober openstaat.",
+            "nl", "Dutch decoy (must not be classified as fr/de/en)"
+        ),
+        ("Short text without enough tokens.", None, "too short"),
+        ("政府は火曜日、新たな規制枠組みを発表した。", None, "non-Latin script"),
+    ]
+    for text, expect, why in detect_cases:
+        got = detect_language(text)
+        if got != expect:
+            failures.append(
+                f"detect_language({why}) = {got!r}, expected {expect!r}"
+            )
+
+    # Unit cases for trim_leading_role_prefix.
+    trim_cases = [
+        ("Patient: Dr. Anna Beispiel", "Dr. Anna Beispiel"),
+        ("Kunde: Maria Muster", "Maria Muster"),
+        # Codex follow-up P2: compact delimiters with/without spacing.
+        ("Patient:Dr. Anna Beispiel", "Dr. Anna Beispiel"),     # no space after :
+        ("Patient :Dr. Anna Beispiel", "Dr. Anna Beispiel"),    # space before :
+        ("Kunde,Maria Muster", "Maria Muster"),                 # no space after ,
+        # Normal name spans pass through unchanged.
+        ("Anna Beispiel", "Anna Beispiel"),
+        ("Dr. Anna Beispiel", "Dr. Anna Beispiel"),
+        # Pure role phrases without a leading single-word role noun.
+        ("Endnutzer oder Käufer", "Endnutzer oder Käufer"),
+    ]
+    for inp, expect in trim_cases:
+        s, e = trim_leading_role_prefix(inp, 0, len(inp))
+        got = inp[s:e]
+        if got != expect:
+            failures.append(
+                f"trim_leading_role_prefix({inp!r}) = {got!r}, expected {expect!r}"
+            )
+
+    labels = labels_for(strict)
+    for lang, case in SELFTEST_CASES.items():
+        sample: str = case["input"]  # type: ignore[assignment]
+        red = Redactor(model, labels, threshold, strict=strict)
+        try:
+            out = red.redact_chunk(sample)
+            out = normalize_unicode(out)
+            out = red.apply_pre_patterns_only(out)
+            out = red.redact_anchored_table_cells(out)
+            red.add_name_aliases()
+            out = red.sweep_recurrences(out)
+        except RedactionError as e:
+            log("selftest", f"[{lang}] redaction failed: {e}",
+                json_mode=json_mode, level="ERROR")
+            raise typer.Exit(code=5)
+        log("selftest", f"[{lang}] input:  {sample}", json_mode=json_mode)
+        log("selftest", f"[{lang}] output: {out}", json_mode=json_mode)
+        for needle in case["must_remove"]:  # type: ignore[union-attr]
+            if needle in out:
+                failures.append(f"{lang}: '{needle}' should be redacted but survived")
+        for needle in case["must_keep"]:  # type: ignore[union-attr]
+            if needle not in out:
+                failures.append(f"{lang}: '{needle}' should be preserved but was redacted")
+        # In default (non-strict) mode, also verify orgs/country/url/BIC/VAT
+        # are PRESERVED (not redacted). Skip those checks in --strict.
+        if not strict:
+            for needle in case.get("default_must_keep", []):  # type: ignore[union-attr]
+                if needle not in out:
+                    failures.append(
+                        f"{lang}: (default) '{needle}' should be preserved but was redacted"
+                    )
+        # In --strict mode, verify the things that are kept by default
+        # ARE redacted with strict on.
+        if strict:
+            for needle in case.get("strict_must_remove", []):  # type: ignore[union-attr]
+                if needle in out:
+                    failures.append(
+                        f"{lang}: (strict) '{needle}' should be redacted but survived"
+                    )
+    if failures:
+        for f in failures:
+            log("selftest", f, json_mode=json_mode, level="ERROR")
+        raise typer.Exit(code=5)
+    mode = "strict" if strict else "default"
+    log("selftest", f"all checks passed ({mode} mode, {'+'.join(SELFTEST_CASES.keys())})",
+        json_mode=json_mode)
+
+
+# ── parallel processing ───────────────────────────────────────────────────
+
+def _worker_init() -> None:
+    """Worker bootstrap: load GLiNER once per process."""
+    global _WORKER_MODEL
+    from gliner import GLiNER  # noqa: PLW0603
+    _WORKER_MODEL = GLiNER.from_pretrained(GLINER_MODEL)
+
+
+def _worker_process(args: tuple) -> Tuple[str, Optional[dict], Optional[str]]:
+    """Run process_pdf in a worker. Returns (input_path, result_dict, error_msg)."""
+    pdf_path, out_dir, rename, threshold, force, strict, ocr = args
+    try:
+        res = process_pdf(
+            Path(pdf_path), Path(out_dir), _WORKER_MODEL,
+            rename=rename, threshold=threshold,
+            json_mode=False, force=force, strict=strict, ocr=ocr,
+        )
+        return (str(pdf_path), res, None)
+    except RedactionError as e:
+        return (str(pdf_path), None, f"redaction: {e}")
+    except Exception as e:
+        return (str(pdf_path), None, f"conversion: {e}")
+
+
+def _run_parallel(
+    inputs: List[Path], out_dir: Path, *, rename: str, threshold: float,
+    force: bool, strict: bool, ocr: bool, json_mode: bool, jobs: int,
+) -> Tuple[List[dict], int]:
+    import concurrent.futures as cf
+    args_list = [
+        (str(p), str(out_dir), rename, threshold, force, strict, ocr)
+        for p in inputs
+    ]
+    results: List[dict] = []
+    failed = 0
+    with cf.ProcessPoolExecutor(max_workers=jobs, initializer=_worker_init) as ex:
+        for pdf_path, res, err in ex.map(_worker_process, args_list):
+            name = Path(pdf_path).name
+            if err is not None:
+                log("redaction" if err.startswith("redaction") else "conversion",
+                    f"failed on {name}: {err}. Output NOT written.",
+                    json_mode=json_mode, level="ERROR")
+                failed += 1
+                continue
+            assert res is not None
+            results.append(res)
+            if json_mode:
+                print(json.dumps(res, ensure_ascii=False))
+            else:
+                log("output",
+                    f"{res['output']} ({res['n_entities']} entities, "
+                    f"{res['n_text_items']} text, {res['n_tables']} tables)")
+    return results, failed
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────
+
+app = typer.Typer(add_completion=False, help=__doc__, no_args_is_help=True)
+
+
+@app.command()
+def main(
+    inputs: List[Path] = typer.Argument(None, help="PDF file(s) to redact."),
+    out_dir: Optional[Path] = typer.Option(
+        None, "--out-dir", "-o",
+        help="Directory for redacted .md output. Default: each PDF's parent "
+             "directory (in-place: contract.pdf → contract.md alongside)."
+    ),
+    rename: str = typer.Option(
+        "keep", "--rename",
+        help="Output naming: keep|auto|ask|hash|<explicit-name>."
+    ),
+    threshold: float = typer.Option(
+        DEFAULT_THRESHOLD, "--threshold", help="GLiNER score threshold."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite existing outputs."
+    ),
+    strict: bool = typer.Option(
+        False, "--strict",
+        help="Also redact organization/company names, country, URLs, BIC, VAT "
+             "IDs. Default keeps these visible (useful when comparing offers "
+             "from named companies). Personal PII is always redacted."
+    ),
+    ocr: bool = typer.Option(
+        False, "--ocr",
+        help="Run OCR on images inside PDFs. Default off (text PDFs only). "
+             "Enable for scanned PDFs without a text layer. Slow."
+    ),
+    jobs: int = typer.Option(
+        1, "--jobs", "-j",
+        help="Process N PDFs in parallel worker processes. Each worker loads "
+             "GLiNER independently (~250MB RAM each); useful for batches of "
+             "≥4 files. Default 1 (serial)."
+    ),
+    json_mode: bool = typer.Option(
+        False, "--json", help="Emit JSON result line per file on stdout."
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Show INFO-level library logs."
+    ),
+    selftest: bool = typer.Option(
+        False, "--selftest", help="Run a built-in correctness check and exit."
+    ),
+):
+    if verbose:
+        logging.getLogger().setLevel(logging.INFO)
+
+    log("init", f"loading GLiNER ({GLINER_MODEL})…", json_mode=json_mode)
+    from gliner import GLiNER
+    model = GLiNER.from_pretrained(GLINER_MODEL)
+
+    if selftest:
+        run_selftest(model, threshold, json_mode=json_mode, strict=strict)
+        raise typer.Exit(code=0)
+
+    if not inputs:
+        log("input", "no input PDFs given. Pass paths as arguments.",
+            json_mode=json_mode, level="ERROR")
+        raise typer.Exit(code=4)
+
+    valid_inputs: List[Path] = []
+    failed = 0
+    for pdf in inputs:
+        if not pdf.exists():
+            log("input", f"not found: {pdf}", json_mode=json_mode, level="ERROR")
+            failed += 1
+        else:
+            valid_inputs.append(pdf)
+
+    # Resolve out_dir per PDF if --out-dir not given; otherwise share one dir.
+    def _out_dir_for(pdf: Path) -> Path:
+        return out_dir if out_dir is not None else pdf.parent
+
+    # Cloud-sync warning: check each unique resolved out_dir once.
+    for d in {_out_dir_for(p).resolve() for p in valid_inputs}:
+        d.mkdir(parents=True, exist_ok=True)
+        warn_if_cloud_synced(d, json_mode=json_mode)
+
+    use_parallel = jobs > 1 and len(valid_inputs) > 1
+    results: List[dict] = []
+    if use_parallel:
+        log("init", f"parallel mode: {jobs} workers across {len(valid_inputs)} files",
+            json_mode=json_mode)
+        # Group by resolved out_dir so each batch shares one path arg.
+        groups: Dict[str, List[Path]] = {}
+        for p in valid_inputs:
+            groups.setdefault(str(_out_dir_for(p).resolve()), []).append(p)
+        for d_str, files in groups.items():
+            sub, n_fail = _run_parallel(
+                files, Path(d_str),
+                rename=rename, threshold=threshold,
+                force=force, strict=strict, ocr=ocr,
+                json_mode=json_mode, jobs=jobs,
+            )
+            results.extend(sub)
+            failed += n_fail
+    else:
+        for pdf in valid_inputs:
+            try:
+                res = process_pdf(
+                    pdf, _out_dir_for(pdf), model,
+                    rename=rename, threshold=threshold,
+                    json_mode=json_mode, force=force, strict=strict, ocr=ocr,
+                )
+                results.append(res)
+                if json_mode:
+                    print(json.dumps(res, ensure_ascii=False))
+                else:
+                    log("output",
+                        f"{res['output']} ({res['n_entities']} entities, "
+                        f"{res['n_text_items']} text, {res['n_tables']} tables)")
+            except RedactionError as e:
+                log("redaction", f"failed on {pdf.name}: {e} "
+                    "Output NOT written (fail-closed).",
+                    json_mode=json_mode, level="ERROR")
+                failed += 1
+            except Exception as e:
+                log("conversion", f"failed on {pdf.name}: {e}. "
+                    "NEXT: verify the file opens in a PDF viewer; if scanned, "
+                    "consider running with --ocr or running ocrmypdf first.",
+                    json_mode=json_mode, level="ERROR")
+                failed += 1
+
+    ok = len(results)
+    total = ok + failed
+    out_summary = (
+        f"output: {out_dir}" if out_dir is not None
+        else "output: alongside each input PDF"
+    )
+    log("summary", f"{ok}/{total} ok | "
+        f"{sum(r['n_entities'] for r in results)} entities total | "
+        f"{out_summary}")
+
+    if failed:
+        raise typer.Exit(code=3)
+
+
+if __name__ == "__main__":
+    app()
