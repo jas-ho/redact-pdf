@@ -39,7 +39,7 @@ Needs [uv](https://docs.astral.sh/uv/). The script is a single file with inline 
 
 First-run download on macOS arm64, measured: about 1.2 GB Python environment (torch, transformers, docling) plus about 1.3 GB of models (GLiNER multi-PII about 1.1 GB, Docling layout models a few hundred MB). Later runs are offline-capable (`HF_HUB_OFFLINE=1`).
 
-Default mode keeps organization names, countries, URLs, BIC and VAT IDs visible, because comparing offers from named companies is a common use. Personal PII is always redacted.
+Default mode keeps organization names, countries, URLs, BIC and VAT IDs visible, because comparing offers from named companies is a common use. Personal PII categories are targeted in both modes, but detection is not complete: see Known limitations for what can survive.
 
 ## Smoke test
 
@@ -48,7 +48,9 @@ Default mode keeps organization names, countries, URLs, BIC and VAT IDs visible,
 ./redact-pdf --selftest --strict   # strict mode
 ```
 
-Runs fictional DE, EN, FR and ES samples plus German edge-case and table samples through the full pipeline and checks must-redact and must-keep lists (dates that are not DOBs, amounts, "Kontoauszug", role nouns, tariff names). Exit code 5 on failure. Both modes pass with the pinned model; one run takes about 40 s on an Apple M3 laptop after the first download.
+Feeds fictional DE, EN, FR and ES samples plus German edge-case, unlabeled-ID and table samples as strings through the redaction stages (per-item redaction, regex post-pass, table DOB anchoring, name aliasing, recurrence sweep) and checks must-redact and must-keep lists (dates that are not DOBs, amounts, "Kontoauszug", role nouns, tariff names). It does not exercise Docling conversion, per-cell table processing, metadata or file writes; `examples/sample-contract.pdf` covers those by eye. Exit code 5 on failure. Documented leaks print as `KNOWN LEAK` warnings without failing the run.
+
+Both modes pass with the pinned GLiNER revision (`GLINER_REVISION` in the script) and the dependency versions locked in `redact-pdf.lock`, which `uv run --script` picks up automatically. One run takes about 40 s on an Apple M3 laptop after the first download.
 
 ## Example
 
@@ -67,8 +69,9 @@ Visible in the example output:
 
 - Placeholders are per surface, not per person: "Herrn Mag. Karl Probstmüller", "Karl Probstmüller" and "PROBSTMÜLLER" each get their own `[person-N]`. Everything is redacted, but a reader cannot tell they are the same person.
 - A bare keyword can become a placeholder (the word "IBAN" in front of an IBAN). Cosmetic, no leak.
+- Postcodes and flat numbers can survive: `1234` and `Top 4` stay visible next to a redacted street and city.
 - A labeled ID needs its label directly before it ("Kundennummer: X" works, "Kundennummer der Hausverwaltung: X" does not).
-- Names inside table cells depend on GLiNER alone; in the selftest's table sample one row's full name survives and another row loses only the first name. Review tables by eye.
+- Names inside table cells depend on GLiNER alone; in the selftest's table sample the shared surname survives in both rows and one first name survives in default mode (reported as `KNOWN LEAK` lines). Review tables by eye.
 
 General:
 

@@ -1,5 +1,5 @@
 // Fictional sample input for redact-pdf. Every name, number and address
-// below is invented; domains use the reserved example.* TLDs.
+// below is invented; domains use the reserved .example TLD (RFC 2606).
 // Build: typst compile examples/sample-contract.typ
 #set document(title: "Mietvertrag Beispiel", author: "Anna Beispiel")
 #set page(paper: "a4", margin: 2cm)
@@ -7,7 +7,7 @@
 
 = Mietvertrag / Tenancy agreement
 
-Zwischen *Frau Dr. Anna Beispiel-Muster*, geb. 14.03.1985, wohnhaft Musterweg 12, 1234 Musterstadt, Tel.: +43 1 999 99 99, E-Mail: anna.beispiel\@example.at (im Folgenden "Vermieterin") und *Herrn Mag. Karl Probstmüller*, Geburtsdatum: 26.07.1962 (im Folgenden "Mieter") wird folgender Vertrag geschlossen.
+Zwischen *Frau Dr. Anna Beispiel-Muster*, geb. 14.03.1985, wohnhaft Musterweg 12, 1234 Musterstadt, Tel.: +43 1 999 99 99, E-Mail: anna.beispiel\@beispiel.example (im Folgenden "Vermieterin") und *Herrn Mag. Karl Probstmüller*, Geburtsdatum: 26.07.1962 (im Folgenden "Mieter") wird folgender Vertrag geschlossen.
 
 == 1. Mietgegenstand
 
@@ -32,4 +32,4 @@ Frau Beispiel-Muster und Herr Probstmüller bestätigen die Vereinbarung. Der Mi
 
 == English summary
 
-Landlord Dr. Anna Beispiel-Muster (email anna.beispiel\@example.at) lets the flat to Mr. Karl Probstmüller from 01/05/2026 for EUR 1,234.56 per month.
+Landlord Dr. Anna Beispiel-Muster (email anna.beispiel\@beispiel.example) lets the flat to Mr. Karl Probstmüller from 01/05/2026 for EUR 1,234.56 per month.

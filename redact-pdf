@@ -105,6 +105,8 @@ for noisy in ("RapidOCR", "docling", "transformers", "urllib3", "huggingface_hub
 import typer  # noqa: E402
 
 GLINER_MODEL = "urchade/gliner_multi_pii-v1"
+# Pinned Hugging Face commit the selftest was last run against.
+GLINER_REVISION = "1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d"
 DEFAULT_THRESHOLD = 0.5
 # Higher thresholds for labels where the model over-fires on German common
 # nouns (Eigentümer/Verbraucher/Erwerber/…). The orthographic capitalization
@@ -670,7 +672,12 @@ def reject_gliner_hit(label: str, surface: str) -> bool:
     # OCR garbage: only reject if the entire surface lacks vowels (German has
     # long consonant clusters like "Strübel" or "Pfister" that are NOT OCR
     # garbage). Real garbage strings tend to be all-consonant or near-it.
-    if not re.search(r"[aeiouäöüáéíóúàèìòù]", surface, re.IGNORECASE):
+    # Surfaces containing a digit are exempt: account, passport and other ID
+    # numbers are vowel-free by nature and must not be dropped. Exception:
+    # "date of birth", where GLiNER tags arbitrary numeric dates (signature
+    # dates, start dates) as DOB; real DOBs come from the anchored regex.
+    if ((label == "date of birth" or not re.search(r"\d", surface))
+            and not re.search(r"[aeiouäöüáéíóúàèìòù]", surface, re.IGNORECASE)):
         if len(surface) >= 6:
             return True
     return False
@@ -1072,7 +1079,8 @@ class Redactor:
                 continue
         # Additionally: sweep pure-digit keys (account/customer numbers) with
         # digit-only lookarounds so they catch standalone recurrences.
-        digit_keys = [k for k in self.entity_map if k.isdigit() and len(k) >= 6]
+        digit_keys = [k for k in self.entity_map
+                      if k.isdigit() and len(k) >= MIN_SURFACE_LEN]
         digit_keys.sort(key=len, reverse=True)
         for key in digit_keys:
             placeholder = self.entity_map[key]
@@ -1446,7 +1454,7 @@ def process_pdf(
 #   - Names: clearly-fake "Beispiel/Muster/Exemple/Ejemplo" pseudonyms.
 #   - IBANs: synthetic check digits / repeating digits.
 #   - IDs:   `999...` and `99999999` patterns to signal "test data".
-#   - Domains: `example.at|fr|es`: RFC 2606 reserved test domains.
+#   - Domains: `*.example` and `example.org|com`: RFC 2606 reserved names.
 #   - Companies: TestVersicherung AG, ExempleCorp etc.
 #
 # `must_remove`: substrings that MUST be gone from output (PII caught).
@@ -1460,10 +1468,10 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
             "Patient: Dr. Anna Beispiel, geb. 14.03.1985, "
             "Polizzen-Nr.: 999/0000001-9, IBAN: AT00 1111 2222 3333 4444, "
             "BIC: TESTAT22XXX, UID: ATU99999999, "
-            "Tel.: +43 1 999 99 99, Email: anna@example.at, "
+            "Tel.: +43 1 999 99 99, Email: anna@beispiel.example, "
             "wohnhaft in Mödling, Österreich. Vertragsbeginn: 01.05.2026. "
             "Betrag: 1.234,56 EUR. Berichtszeitraum: 01.2025. "
-            "Bracket: 03/2025. Weitere Infos: www.testversicherung.at/info. "
+            "Bracket: 03/2025. Weitere Infos: www.testversicherung.example/info. "
             "Wie oben erwähnt, hat Dr. Anna Beispiel zugestimmt. "
             "Frau Muster-Beispiel, geb. Probe-Schmidt, war Zeugin. "
             "Mag. Hans Probstmüller hat den Kontoauszug für den Kontoabschluss "
@@ -1475,7 +1483,7 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
             # Personal PII: redacted in both modes
             "Anna", "Beispiel", "14.03.1985", "999/0000001-9",
             "AT00",
-            "anna@example.at", "+43",
+            "anna@beispiel.example", "+43",
             "Probe-Schmidt", "Muster-Beispiel",
             "Probstmüller", "26.07.1962",
         ],
@@ -1493,7 +1501,7 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
         "default_must_keep": [
             "TestVersicherung",          # company name
             "Österreich",                # country
-            "www.testversicherung.at",   # URL
+            "www.testversicherung.example",   # URL
             "TESTAT22XXX",               # BIC (bank, not user)
             "ATU99999999",               # VAT ID (company, not user)
         ],
@@ -1520,14 +1528,14 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
         "input": (
             "Patiente : Dr. Marie Exemple, née le 14/03/1985, "
             "IBAN: FR00 0000 1111 2222 3333 4444 555, "
-            "Tél : +33 1 99 99 99 99, courriel : marie@example.fr. "
+            "Tél : +33 1 99 99 99 99, courriel : marie@exemple.example. "
             "Numéro de compte: 9999999999. "
             "M. Paul Exemple, né Lévêque-Test, est son père. "
             "N° de référence: REF-99999. Le client a confirmé."
         ),
         "must_remove": [
             "Marie", "Exemple", "14/03/1985", "FR00",
-            "marie@example.fr", "+33", "9999999999", "Lévêque-Test",
+            "marie@exemple.example", "+33", "9999999999", "Lévêque-Test",
             "REF-99999",
         ],
         "must_keep": [
@@ -1539,13 +1547,13 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
         "input": (
             "Paciente: Dr. María Ejemplo, nacida el 14/03/1985, "
             "IBAN: ES00 0000 1111 2222 3333 4444, "
-            "Tel: +34 600 99 99 99, correo: maria@example.es. "
+            "Tel: +34 600 99 99 99, correo: maria@ejemplo.example. "
             "Número de cuenta: 9999999999. "
             "Sr. José Ejemplo, nacido como Prueba-Ríos."
         ),
         "must_remove": [
             "María", "Ejemplo", "14/03/1985", "ES00",
-            "maria@example.es", "+34", "9999999999", "Prueba-Ríos",
+            "maria@ejemplo.example", "+34", "9999999999", "Prueba-Ríos",
         ],
         "must_keep": [],
     },
@@ -1614,6 +1622,17 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
             "https://www.example.org/privacy",            # URL (redacted strict)
         ],
     },
+    # Unlabeled numeric IDs: vowel-free surfaces that the OCR-garbage filter
+    # used to drop. Regex does not cover these shapes, so GLiNER must.
+    "IDS": {
+        "input": (
+            "Bitte überweisen Sie den Betrag auf das Bankkonto 48213377 bei "
+            "der Testbank. Der Reisepass des Kunden hat die Nummer P4821337."
+        ),
+        "must_remove": ["48213377", "P4821337"],
+        "must_keep": [],
+        "default_must_keep": ["Testbank"],
+    },
     # Markdown tables: anchor (e.g. `Geburtsdatum`) and value (a date) in
     # SEPARATE cells. The per-item GLiNER pass and apply_pre_patterns_only
     # are single-line: only redact_anchored_table_cells catches these.
@@ -1650,7 +1669,15 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
             "08.04.1993",     # DOB in wide table, row 1
             "14.07.1990",     # DOB in wide table, row 2
             # Surname Klein, in person context with title, MUST be caught.
-            "Anna Klein",
+            # Checked per component: "Anna Klein" alone would pass if only
+            # the first name were removed.
+            "Anna Klein", "Klein",
+        ],
+        # Known leaks, documented in the README: names in table cells depend
+        # on GLiNER alone. Reported as KNOWN LEAK lines, not failures; move
+        # an entry to must_remove once it is fixed.
+        "known_leaks": [
+            "Anna", "Karl", "Beispiel",
         ],
         "must_keep": [
             # Beginn dates are NOT DOB: they share the table but the
@@ -1668,9 +1695,10 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
 def run_selftest(
     model, threshold: float, *, json_mode: bool = False, strict: bool = False,
 ) -> None:
-    """Run all language samples through the FULL pipeline:
-    per-item redaction → pre-pattern post-pass → name aliasing → recurrence
-    sweep. Same order as `process_pdf`."""
+    """Run all samples as strings through the redaction stages:
+    per-item redaction → pre-pattern post-pass → table DOB anchoring → name
+    aliasing → recurrence sweep. Same order as `process_pdf`, but without
+    Docling conversion, per-cell table processing, metadata or file writes."""
     failures: List[str] = []
 
     # Unit-level guards for filtering logic that GLiNER's synthetic-data
@@ -1694,6 +1722,11 @@ def run_selftest(
         # Real multi-token names pass cleanly.
         ("person", "Anna Beispiel", False, "regular name"),
         ("person", "Frau Schmidt", False, "title + surname"),
+        # Vowel-free ID numbers must survive the OCR-garbage filter.
+        ("bank account number", "12345678", False, "bare 8-digit account number"),
+        ("passport number", "P1234567", False, "short passport number"),
+        ("person", "Xkcdtrm", True, "vowel-free OCR garbage"),
+        ("date of birth", "28.09.2026", True, "unanchored numeric date as DOB"),
     ]
     for label, surface, expect, why in reject_cases:
         got = reject_gliner_hit(label, surface)
@@ -1776,6 +1809,14 @@ def run_selftest(
                 f"trim_leading_role_prefix({inp!r}) = {got!r}, expected {expect!r}"
             )
 
+    # Unit case for sweep_recurrences: short (4-5 digit) numeric IDs found
+    # once must be replaced at later bare occurrences too.
+    red = Redactor(model, labels_for(strict), threshold, strict=strict)
+    red.entity_map["48213"] = "[account-1]"
+    swept = red.sweep_recurrences("Konto 48213, Ref. 48213; 148213 bleibt.")
+    if swept != "Konto [account-1], Ref. [account-1]; 148213 bleibt.":
+        failures.append(f"sweep_recurrences short numeric ID: got {swept!r}")
+
     labels = labels_for(strict)
     for lang, case in SELFTEST_CASES.items():
         sample: str = case["input"]  # type: ignore[assignment]
@@ -1799,6 +1840,13 @@ def run_selftest(
         for needle in case["must_keep"]:  # type: ignore[union-attr]
             if needle not in out:
                 failures.append(f"{lang}: '{needle}' should be preserved but was redacted")
+        for needle in case.get("known_leaks", []):  # type: ignore[union-attr]
+            if needle in out:
+                log("selftest", f"[{lang}] KNOWN LEAK: '{needle}' survived",
+                    json_mode=json_mode, level="WARN")
+            else:
+                log("selftest", f"[{lang}] known leak '{needle}' did not "
+                    "survive this run", json_mode=json_mode)
         # In default (non-strict) mode, also verify orgs/country/url/BIC/VAT
         # are PRESERVED (not redacted). Skip those checks in --strict.
         if not strict:
@@ -1830,7 +1878,7 @@ def _worker_init() -> None:
     """Worker bootstrap: load GLiNER once per process."""
     global _WORKER_MODEL
     from gliner import GLiNER  # noqa: PLW0603
-    _WORKER_MODEL = GLiNER.from_pretrained(GLINER_MODEL)
+    _WORKER_MODEL = GLiNER.from_pretrained(GLINER_MODEL, revision=GLINER_REVISION)
 
 
 def _worker_process(args: tuple) -> Tuple[str, Optional[dict], Optional[str]]:
@@ -1935,7 +1983,7 @@ def main(
 
     log("init", f"loading GLiNER ({GLINER_MODEL})…", json_mode=json_mode)
     from gliner import GLiNER
-    model = GLiNER.from_pretrained(GLINER_MODEL)
+    model = GLiNER.from_pretrained(GLINER_MODEL, revision=GLINER_REVISION)
 
     if selftest:
         run_selftest(model, threshold, json_mode=json_mode, strict=strict)

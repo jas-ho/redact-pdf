@@ -1,7 +1,7 @@
 {
   "26.07.1962": "[date_of_birth-1]",
   "Herrn Mag. Karl Probstmüller": "[person-1]",
-  "anna.beispiel@example.at": "[email-1]",
+  "anna.beispiel@beispiel.example": "[email-1]",
   "+43 1 999 99 99": "[phone_number-1]",
   "Musterstadt": "[city-1]",
   "Musterweg 12": "[street_address-1]",
