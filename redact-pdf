@@ -333,6 +333,55 @@ ACCOUNT_ANCHORS = (
     r"ap[óo]lice)"
 )
 
+# Field labels are context, not values. Reuse the multilingual ID/DOB
+# anchors and detector labels so this guard also covers overlap fragments.
+FIELD_LABEL_RE = re.compile(
+    rf"(?:{ACCOUNT_ANCHORS}|{DOB_ANCHORS}|"
+    + "|".join(re.escape(label) for label in LABELS_CORE + LABELS_STRICT_EXTRA)
+    + r"|BIC|SWIFT(?:[- /]BIC)?|Tel(?:efon|ephone)?|Telefonnummer|"
+      r"E[- ]?Mail(?:[- ]?Adresse)?|UID|VAT(?:[- ]?ID)?|"
+      r"Steuernummer|Steuer[- ]?ID|IBAN[- ]?Nummer)",
+    re.IGNORECASE,
+)
+FIELD_PREFIX_RE = re.compile(
+    rf"^(?:{FIELD_LABEL_RE.pattern})(?!\w)\.?(?:\s*[:;#]\s*|\s+)",
+    re.IGNORECASE,
+)
+FIELD_EXPLICIT_PREFIX_RE = re.compile(
+    rf"^(?:{FIELD_LABEL_RE.pattern})(?!\w)\.?\s*[:;#]\s*", re.IGNORECASE,
+)
+# Words such as Swift/Born and Tel (Aviv) can be real names or places.
+# For these detector types, require an explicit field separator.
+NAME_PLACE_LABELS = {"person", "company", "organization", "city", "country",
+                     "street address", "full address"}
+
+PERSON_TITLE_RE = re.compile(
+    r"^(?:(?:Dr|Mr|Mrs|Ms|Prof(?:essor)?|Sr|Sra|"
+    r"Frau|Herrn?|Madame|Monsieur|Mlle|Sig(?:\.ra)?|"
+    r"Mag(?:\.a)?|Dipl(?:\.-Ing)?|Ing|(?-i:DI)|MMag|"
+    r"Univ\.?-?Prof|BSc|MSc|LL\.?M|MBA|PhD)\.?\s+)+",
+    re.IGNORECASE,
+)
+PERSON_SUFFIX_RE = re.compile(
+    r"(?:BSc|MSc|LL\.?M|MBA|PhD|jun|sen|jr|sr)\.?",
+    re.IGNORECASE,
+)
+
+
+def person_name(surface: str) -> str:
+    """Canonical spelling without leading salutations/titles."""
+    return PERSON_TITLE_RE.sub("", normalize(surface)).strip(" .,;:()")
+
+
+def surname_of(cleaned: str) -> str:
+    """Ignore trailing qualifications for ambiguity checks, not identity."""
+    tokens = [token.strip(".,;:()") for token in cleaned.split()]
+    # Leave at least a given name and surname: Sen/Jun can be surnames.
+    while len(tokens) > 2 and PERSON_SUFFIX_RE.fullmatch(tokens[-1]):
+        tokens.pop()
+    return tokens[-1]
+
+
 # Structured ID patterns. Each: (label, regex). Capture group convention: if
 # the pattern uses a capture group, ONLY that group is redacted; otherwise
 # the whole match. Surface is validated by `reject_regex_match`.
@@ -620,6 +669,9 @@ def reject_gliner_hit(label: str, surface: str) -> bool:
     surface = surface.strip()
     if not surface or len(surface) < MIN_SURFACE_LEN:
         return True
+    if ((label not in NAME_PLACE_LABELS or surface.endswith((":", ";", "#")))
+            and FIELD_LABEL_RE.fullmatch(surface.strip(" .:;#"))):
+        return True
     if surface.lower() in STOPWORDS:
         return True
     if PLACEHOLDER_RE.search(surface):
@@ -731,6 +783,8 @@ class Redactor:
         self.strict = strict
         self.entity_map: Dict[str, str] = {}
         self.counters: Dict[str, int] = {}
+        self.person_ids: Dict[str, str] = {}
+        self.person_redirects: Dict[str, str] = {}
 
     def _label_slug(self, label: str) -> str:
         return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
@@ -739,6 +793,17 @@ class Redactor:
         key = self._label_slug(label)
         self.counters[key] = self.counters.get(key, 0) + 1
         return f"[{key}-{self.counters[key]}]"
+
+    def _placeholder_for(self, key: str, label: str) -> str:
+        if key not in self.entity_map:
+            if label == "person":
+                canon = person_name(key).casefold()
+                if canon not in self.person_ids:
+                    self.person_ids[canon] = self._next_id(label)
+                self.entity_map[key] = self.person_ids[canon]
+            else:
+                self.entity_map[key] = self._next_id(label)
+        return self.entity_map[key]
 
     def _collect_regex_spans(self, text: str) -> List[Span]:
         spans: List[Span] = []
@@ -776,8 +841,16 @@ class Redactor:
                 continue
             if start < 0 or end <= start or end > len(text):
                 continue
-            surface = text[start:end]  # canonical, ignore e["text"]
+            # GLiNER can include "IBAN " / "E-Mail: " in the value span.
+            # Trim before overlap resolution, preserving label punctuation
+            # and spacing even when the value has no regex detector.
             label = e.get("label", "misc")
+            prefix_re = (FIELD_EXPLICIT_PREFIX_RE if label in NAME_PLACE_LABELS
+                         else FIELD_PREFIX_RE)
+            prefix = prefix_re.match(text[start:end])
+            if prefix:
+                start += prefix.end()
+            surface = text[start:end]  # canonical, ignore e["text"]
             score = float(e.get("score") or 0.0)
             # Per-label score floor for labels that the model over-fires on
             # (see PER_LABEL_THRESHOLDS).
@@ -848,9 +921,8 @@ class Redactor:
             # may have shrunk into something label-incompatible.
             if span.source == "gliner" and reject_gliner_hit(span.label, key):
                 continue
-            if key not in self.entity_map:
-                self.entity_map[key] = self._next_id(span.label)
-            text = text[:span.start] + self.entity_map[key] + text[span.end:]
+            placeholder = self._placeholder_for(key, span.label)
+            text = text[:span.start] + placeholder + text[span.end:]
         return text
 
     # backward-compat alias
@@ -869,9 +941,8 @@ class Redactor:
             key = normalize(surface)
             if not key or len(key) < MIN_SURFACE_LEN:
                 continue
-            if key not in self.entity_map:
-                self.entity_map[key] = self._next_id(span.label)
-            text = text[:span.start] + self.entity_map[key] + text[span.end:]
+            placeholder = self._placeholder_for(key, span.label)
+            text = text[:span.start] + placeholder + text[span.end:]
         return text
 
     def redact_anchored_table_cells(self, markdown: str) -> str:
@@ -951,9 +1022,7 @@ class Redactor:
                         return surface
                 elif len(key) < MIN_SURFACE_LEN:
                     return surface
-                if key not in self.entity_map:
-                    self.entity_map[key] = self._next_id(label)
-                return self.entity_map[key]
+                return self._placeholder_for(key, label)
             return value_re.sub(_sub, cell)
 
         lines = markdown.splitlines()
@@ -1003,85 +1072,69 @@ class Redactor:
         return "\n".join(lines)
 
     def add_name_aliases(self) -> None:
-        """For each `person` entity in the map, register a compound-surname
-        alias pointing to the SAME placeholder, so the recurrence sweep
-        catches bare-surname references GLiNER missed.
+        """Finalize person aliases after all chunks, tables and metadata.
 
-        Conservative criteria: every condition below must hold:
-          • Label is `person`.
-          • Original surface has a stripped title (Dr./Mr./Mag./Dipl./Frau/…)
-            OR is plain Title Case with ≥2 tokens. This filters out
-            single all-caps headings and bare role nouns.
-          • No token in the cleaned surface is a known role noun
-            (Eigentümer, Schuldner, Anwesende, …): those are likely
-            GLiNER false-positive labels of legal-document roles.
-          • Last token is either: hyphenated compound (≥5 chars), OR a long
-            single token (≥8 chars) AND the original had a title prefix.
-
-        Collision-safe: aliases that already exist (in entity_map or in this
-        round's `new` dict) are NOT overwritten: first-seen wins."""
-        title_prefix = re.compile(
-            r"^(?:"
-            r"(?:Dr|Mr|Mrs|Ms|Prof(?:essor)?|Sr|Sra|"
-            r"Frau|Herr|Madame|Monsieur|Mlle|M|"
-            r"Sig|Sig\.ra|"
-            r"Mag(?:\.a)?|Dipl(?:\.-Ing)?|Ing|DI|MMag|"
-            r"Univ\.?-?Prof|BSc|MSc|LL\.?M|MBA|PhD)\.?\s+"
-            r")+",
-            re.IGNORECASE,
-        )
-        # role_nouns is the module-level ROLE_NOUNS: same set used to
-        # reject GLiNER hits at the source.
-
-        def is_proper_case_name_token(token: str) -> bool:
-            """Title Case: starts uppercase, has at least one lowercase char.
-            Rejects all-caps tokens like EIGENTÜMER (heading style)."""
-            if not token or not token[0].isupper():
-                return False
-            stripped = token.strip(".,;:")
-            return any(c.islower() for c in stripped)
-
-        new: Dict[str, str] = {}
-        for surface, placeholder in list(self.entity_map.items()):
-            if not placeholder.startswith("[person-"):
-                continue
-            cleaned, n_titles = title_prefix.subn("", surface)
-            cleaned = cleaned.strip()
-            had_title = n_titles > 0
+        Full names share IDs after title/case/whitespace normalization.
+        Surname-only mentions join a full name only if its surname is unique
+        across the document. Delay that decision until here: a later chunk
+        may introduce another person with the same surname.
+        """
+        people = [(surface, placeholder, person_name(surface))
+                  for surface, placeholder in self.entity_map.items()
+                  if placeholder.startswith("[person-")]
+        surnames: Dict[str, set] = {}
+        for surface, placeholder, cleaned in people:
             tokens = cleaned.split()
-            if len(tokens) < 2:
+            if len(tokens) >= 2:
+                surnames.setdefault(surname_of(cleaned).casefold(), set()).add(placeholder)
+
+        for surface, placeholder, cleaned in people:
+            tokens = cleaned.split()
+            if len(tokens) == 1:
+                candidates = surnames.get(cleaned.casefold(), set())
+                target = placeholder
+                if len(candidates) == 1:
+                    target = next(iter(candidates))
+                    self.person_redirects[placeholder] = target
+                    self.entity_map[surface] = target
+                    self.person_ids[cleaned.casefold()] = target
+                if len(cleaned) >= MIN_SURFACE_LEN:
+                    for variant in (cleaned, cleaned.upper()):
+                        self.entity_map.setdefault(variant, target)
+
+        # Keep conservative criteria for discovering *undetected* surnames;
+        # already detected surname mentions above need no length heuristic.
+        for surface, placeholder, cleaned in people:
+            tokens = cleaned.split()
+            if len(tokens) < 2 or any(
+                strip_articles(t).lower().strip(".,;:") in ROLE_NOUNS
+                for t in tokens
+            ):
                 continue
-            # Reject if any token (lowercased, articles stripped) is a known
-            # role noun. The strip_articles covers cases where an article
-            # token slipped in via Docling glitches.
-            if any(strip_articles(t).lower().strip(".,;:") in ROLE_NOUNS
-                   for t in tokens):
-                continue
-            # Require proper Title Case across all tokens: rules out
-            # all-caps headings like "ANWESENDEN" sneaking through.
-            if not all(is_proper_case_name_token(t) for t in tokens):
-                continue
-            last = tokens[-1].strip(".,;:")
+            for variant in (cleaned, cleaned.upper()):
+                self.entity_map.setdefault(variant, placeholder)
+            last = surname_of(cleaned)
             is_compound = "-" in last and len(last) >= ALIAS_COMPOUND_MIN_LEN
-            is_long_single = (
-                len(last) >= ALIAS_SINGLE_MIN_LEN
-                and last[0].isupper()
-                and had_title           # high-confidence only
-            )
-            if not (is_compound or is_long_single):
+            is_long_titled = (len(last) >= ALIAS_SINGLE_MIN_LEN
+                              and PERSON_TITLE_RE.match(normalize(surface)))
+            if not (is_compound or is_long_titled):
                 continue
+            candidates = surnames[last.casefold()]
+            # Still redact an undetected ambiguous surname, but give it its
+            # own ID rather than arbitrarily attributing it to one person.
+            target = (placeholder if len(candidates) == 1
+                      else self._placeholder_for(last, "person"))
             for variant in (last, last.upper()):
-                if not variant:
-                    continue
-                if variant in self.entity_map or variant in new:
-                    continue
-                new[variant] = placeholder
-        self.entity_map.update(new)
+                self.entity_map.setdefault(variant, target)
 
     def sweep_recurrences(self, text: str) -> str:
         """Replace any literal occurrence of a known entity_map key. Word-
         boundary anchored; longest keys first to avoid `John` clobbering
         `John Smith`. Skips keys already containing placeholders."""
+        # Unify placeholders already emitted before surname ambiguity was
+        # known. Exact token substitution avoids person-1/person-10 collisions.
+        text = re.sub(r"\[person-\d+\]",
+                      lambda m: self.person_redirects.get(m.group(), m.group()), text)
         # Sort by length desc; skip placeholder-shaped or pure-digit keys
         # that the pre-pattern pass will have already covered.
         keys = [k for k in self.entity_map.keys()
@@ -1509,6 +1562,7 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
         ],
         "must_keep": [
             "01.05.2026", "1.234,56", "01.2025", "03/2025",
+            "IBAN:", "BIC:", "Tel.:", "Email:",
             # Word-internal anchor false-positives that must NOT trigger:
             "Kontoauszug", "Kontoabschluss",
             # Function-word capture by maiden-name regex must NOT trigger:
@@ -1715,6 +1769,136 @@ def run_selftest(
     aliasing → recurrence sweep. Same order as `process_pdf`, but without
     Docling conversion, per-cell table processing, metadata or file writes."""
     failures: List[str] = []
+
+    # Deterministic model spans exercise wide hits, standalone labels and
+    # overlap splitting without depending on GLiNER's probabilistic output.
+    class WholeSpanModel:
+        def __init__(self, label: str):
+            self.label = label
+
+        def predict_entities(self, text, labels, threshold):
+            return [{"start": 0, "end": len(text), "label": self.label,
+                     "score": 1.0}]
+
+    for surface, label in (("Born", "person"), ("Swift", "person"),
+                           ("Iban", "person"), ("Tel Aviv", "city"),
+                           ("company.example", "url")):
+        red = Redactor(WholeSpanModel(label), labels_for(strict), threshold,
+                       strict=strict)
+        out = red.redact_chunk(surface)
+        if surface not in red.entity_map or out != red.entity_map[surface]:
+            failures.append(f"name resembling field label {surface!r}: {out!r}")
+
+    for keyword, value, label in (
+        ("IBAN", "AT00 1111 2222 3333 4444", "IBAN"),
+        ("BIC", "TESTAT22XXX", "bank account number"),
+        ("Tel.", "+43 1 999 99 99", "phone number"),
+        ("E-Mail", "anna@beispiel.example", "email"),
+        ("Kundennummer", "TST-99887766", "bank account number"),
+        ("Account number", "AB123456", "bank account number"),
+        ("Geburtsdatum", "14.03.1985", "date of birth"),
+    ):
+        red = Redactor(WholeSpanModel(label), labels_for(strict), threshold,
+                       strict=strict)
+        for bare in (keyword, keyword.upper() + ":"):
+            if red.redact_chunk(bare) != bare:
+                failures.append(f"field label {bare!r}: bare keyword redacted")
+        for separator in (" ", ": ", ":"):
+            inp = keyword + separator + value
+            out = red.redact_chunk(inp)
+            red.add_name_aliases()
+            out = red.sweep_recurrences(out)
+            if (not out.startswith(keyword + separator + "[")
+                    or value in out or keyword in red.entity_map):
+                failures.append(f"field label {inp!r}: got {out!r}")
+        # Even a label left over AFTER splitting must be rejected.
+        if not reject_gliner_hit(label, keyword + " "):
+            failures.append(f"field label fragment {keyword!r}: accepted")
+
+    variants = [
+        "Herrn Mag. Karl Probstmüller", "Karl Probstmüller",
+        "KARL PROBSTMÜLLER", "  Karl\t Probstmüller  ",
+        "Mr. Dr. Karl Probstmüller", "Mrs. Karl Probstmüller",
+        "Ms. Prof. Karl Probstmüller", "Frau Karl Probstmüller",
+    ]
+    # A surname may precede its full name; a second person may occur only
+    # in a later table/metadata chunk. Test both document orders.
+    for surname in ("Probstmüller", "Beispiel-Muster", "Li"):
+        for ambiguous in (False, True):
+            surfaces = [v.replace("Probstmüller", surname)
+                        .replace("PROBSTMÜLLER", surname.upper()) for v in variants]
+            mentions = [surname.upper(), "Herr " + surname] + surfaces
+            if ambiguous:
+                mentions.append("Lena " + surname)
+            for ordered in (mentions, list(reversed(mentions))):
+                red = Redactor(WholeSpanModel("person"), ["person"], threshold,
+                               strict=strict)
+                outputs = [red.redact_chunk(s) for s in ordered]
+                # Table anchoring also registers names (including short ones).
+                table = "| Name |\n|---|\n| " + surname.upper() + " |"
+                outputs.append(red.redact_anchored_table_cells(table))
+                red.add_name_aliases()
+                out = red.sweep_recurrences("\n".join(outputs))
+                ids = {red.entity_map[normalize(s)] for s in surfaces}
+                if len(ids) != 1:
+                    failures.append(f"person variants {surname}: {ids}")
+                target = red.entity_map[normalize(surfaces[0])]
+                bare = red.entity_map[surname.upper()]
+                if ambiguous:
+                    other = red.entity_map["Lena " + surname]
+                    if target == other or bare in (target, other):
+                        failures.append(f"ambiguous surname {surname}: merged people")
+                elif bare != target or red.entity_map["Herr " + surname] != target:
+                    failures.append(f"unique surname {surname}: separate IDs")
+                if not ambiguous and set(re.findall(r"\[person-\d+\]", out)) != {target}:
+                    failures.append(f"person {surname}: stale IDs in rendered output")
+                if len(surname) >= MIN_SURFACE_LEN and surname.casefold() in out.casefold():
+                    failures.append(f"person {surname}: raw surname survived")
+                if ambiguous and not set(re.findall(r"\[person-\d+\]", out)) <= {target, other, bare}:
+                    failures.append(f"person {surname}: unexpected IDs in output")
+
+    for suffix in (",", " BSc", " MSc", " Jr."):
+        red = Redactor(WholeSpanModel("person"), ["person"], threshold,
+                       strict=strict)
+        for surface in ("Karl Probstmüller", "Lena Probstmüller" + suffix,
+                        "Herr Probstmüller"):
+            red.redact_chunk(surface)
+        red.add_name_aliases()
+        out = red.sweep_recurrences("Probstmüller / PROBSTMÜLLER")
+        ids = {red.entity_map[s] for s in (
+            "Karl Probstmüller", "Lena Probstmüller" + suffix, "Herr Probstmüller")}
+        if len(ids) != 3 or "probstmüller" in out.casefold():
+            failures.append(f"surname punctuation/qualification {suffix!r}: merged or leaked")
+
+    red = Redactor(WholeSpanModel("person"), ["person"], threshold, strict=strict)
+    for surface in ("Karl Probstmüller", "Herr Probstmüller"):
+        red.redact_chunk(surface)
+    red.add_name_aliases()
+    if red.sweep_recurrences("Probstmüller") != red.entity_map["Karl Probstmüller"]:
+        failures.append("detected titled surname: undetected bare recurrence leaked")
+    if person_name("Sig. Di Stefano") != "Di Stefano":
+        failures.append("title normalization stripped the name particle Di")
+    if surname_of("Amartya Sen") != "Sen" or surname_of("Karl Jun Jr.") != "Jun":
+        failures.append("surname normalization stripped a real surname")
+    red = Redactor(WholeSpanModel("person"), ["person"], threshold, strict=strict)
+    mentions = ("Karl Probstmüller", "M. Probstmüller", "Herr Probstmüller")
+    for surface in mentions:
+        red.redact_chunk(surface)
+    red.add_name_aliases()
+    if len({red.entity_map[s] for s in mentions}) != 3:
+        failures.append("ambiguous initial M.: merged distinct person mentions")
+
+    for ambiguous in (False, True):
+        red = Redactor(WholeSpanModel("person"), ["person"], threshold, strict=strict)
+        red.redact_chunk("Herrn Mag. Karl Probstmüller")
+        if ambiguous:
+            red.redact_chunk("Lena Probstmüller")
+        red.add_name_aliases()
+        out = red.sweep_recurrences("Probstmüller / PROBSTMÜLLER")
+        bare = red.entity_map["Probstmüller"]
+        full = red.entity_map["Herrn Mag. Karl Probstmüller"]
+        if out != f"{bare} / {bare}" or (bare == full) == ambiguous:
+            failures.append("undetected surname: leaked or incorrectly merged")
 
     # Unit-level guards for filtering logic that GLiNER's synthetic-data
     # behavior is too unreliable to exercise end-to-end. Each entry:
