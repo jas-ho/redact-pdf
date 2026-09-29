@@ -2,6 +2,8 @@
 
 Turn a PDF into Markdown with personal data replaced by stable placeholders like `[person-1]` or `[iban-1]`, so the text can go to an LLM (or a colleague) without the original names, dates of birth, account numbers and contact details.
 
+![Before and after: a fictional German tenancy contract PDF with names, birth dates, address, phone and email, next to the Markdown redact-pdf produces, where each of these is replaced by a placeholder such as [person-1], [date_of_birth-1] or [email-1]](docs/img/before-after.png)
+
 Built for contracts, insurance papers, tax and bank letters in German and English, where you want an AI to read the substance but not the identities.
 
 ## What it does
