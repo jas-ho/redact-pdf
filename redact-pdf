@@ -890,11 +890,9 @@ class Redactor:
                 | Anna    | 08.04.1993   | 01.03  |
              Anchor in header at column 1, values in column 1 of data rows.
 
-        Only DOB is propagated for now: the FP risk on customer_number-
-        style anchors with looser value patterns is higher than the leak
-        risk (those patterns are already caught by the per-cell GLiNER pass
-        plus the regex post-pass since both ends typically appear in one
-        line of the rendered markdown).
+        DOB anchors also work row-locally. Name anchors only propagate down
+        a column under an exact header match, so a generic `Name` label
+        cannot cause neighboring tariff or role columns to be redacted.
         """
         # (label, anchor_regex, value_regex)
         anchors = [
@@ -904,6 +902,20 @@ class Redactor:
                  r"\b\d{1,2}\.\d{1,2}\.\d{2,4}\b"
                  r"|\b\d{1,2}/\d{1,2}/\d{2,4}\b"
                  r"|\b\d{4}-\d{2}-\d{2}\b")),
+            ("person",
+             re.compile(
+                 r"(?i)^\s*[*_]*(?:"
+                 r"name|vorname|nachname|familienname|"
+                 r"versicherte\s+person(?:en)?|mitglied|"
+                 r"full\s+name|first\s+name|last\s+name|surname|given\s+name|"
+                 r"nom|prénom|prenom|nom\s+de\s+famille|"
+                 r"nombre|apellidos?"
+                 r")[*_]*\s*:?\s*$"),
+             # Match existing placeholders first, then Unicode name runs
+             # (including short names, initials and compound surnames).
+             re.compile(
+                 rf"{PLACEHOLDER_RE.pattern}|"
+                 r"[^\W\d_]+(?:[ \t.'’\-]+[^\W\d_]+)*")),
         ]
 
         def is_table_row(s: str) -> bool:
@@ -931,7 +943,13 @@ class Redactor:
             def _sub(m):
                 surface = m.group(0)
                 key = normalize(surface)
-                if len(key) < MIN_SURFACE_LEN:
+                if PLACEHOLDER_RE.fullmatch(surface):
+                    return surface
+                if label == "person":
+                    canon = strip_articles(key).lower().strip(".,;:")
+                    if canon in ROLE_NOUNS or canon in TIER_NOUNS:
+                        return surface
+                elif len(key) < MIN_SURFACE_LEN:
                     return surface
                 if key not in self.entity_map:
                     self.entity_map[key] = self._next_id(label)
@@ -960,6 +978,8 @@ class Redactor:
                 if col_idx in anchor_cols:
                     continue
                 for ac_idx, (value_re, label) in anchor_cols.items():
+                    if label == "person":
+                        continue
                     cells[col_idx] = _replace_in_cell(
                         cells[col_idx], value_re, label
                     )
@@ -1672,11 +1692,6 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
             # Checked per component: "Anna Klein" alone would pass if only
             # the first name were removed.
             "Anna Klein", "Klein",
-        ],
-        # Known leaks, documented in the README: names in table cells depend
-        # on GLiNER alone. Reported as KNOWN LEAK lines, not failures; move
-        # an entry to must_remove once it is fixed.
-        "known_leaks": [
             "Anna", "Karl", "Beispiel",
         ],
         "must_keep": [
@@ -1696,7 +1711,7 @@ def run_selftest(
     model, threshold: float, *, json_mode: bool = False, strict: bool = False,
 ) -> None:
     """Run all samples as strings through the redaction stages:
-    per-item redaction → pre-pattern post-pass → table DOB anchoring → name
+    per-item redaction → pre-pattern post-pass → table DOB/name anchoring → name
     aliasing → recurrence sweep. Same order as `process_pdf`, but without
     Docling conversion, per-cell table processing, metadata or file writes."""
     failures: List[str] = []
@@ -1816,6 +1831,51 @@ def run_selftest(
     swept = red.sweep_recurrences("Konto 48213, Ref. 48213; 148213 bleibt.")
     if swept != "Konto [account-1], Ref. [account-1]; 148213 bleibt.":
         failures.append(f"sweep_recurrences short numeric ID: got {swept!r}")
+
+    # Exercise header anchoring without NER: every name must be caught even
+    # when the model misses it, including partially redacted and short names.
+    for header in (
+        "Name", "Vorname", "Nachname", "Familienname", "Versicherte Person",
+        "Versicherte Personen", "Mitglied", "First name", "Last name",
+        "Full name", "Given name", "Surname", "Nom", "Prénom", "Prenom",
+        "Nom de famille", "Nombre", "Apellido", "Apellidos", "**NAME**:",
+    ):
+        red = Redactor(None, [], threshold)
+        red.entity_map["Karl"] = "[person-1]"
+        red.counters["person"] = 1
+        table = (
+            f"| {header} | Tarif | Rolle | Beginn |\n"
+            "|---|---|---|---|\n"
+            "| Anna Beispiel | Standard | Versicherungsnehmerin | 01.03.2025 |\n"
+            "| [person-1] Beispiel | Premium | Eigentümer | 02.03.2025 |\n"
+            "| Li | 200 | Kunde | 03.03.2025 |\n"
+            "| Élodie O’Neill | 500 | Mieter | 04.03.2025 |\n"
+            "| Karl | 300 | Zeuge | 05.03.2025 |\n"
+            "| Versicherungsnehmer | 400 | Kunde | 06.03.2025 |\n"
+            "| | 600 | Kunde | 07.03.2025 |"
+        )
+        out = red.redact_anchored_table_cells(table)
+        for name in ("Anna", "Beispiel", "Li", "Élodie", "O’Neill", "Karl"):
+            if name in out:
+                failures.append(f"table header {header!r}: {name!r} survived")
+        # Only column zero may change; headers, separators and adjacent
+        # cells must stay byte-for-byte intact.
+        before, after = table.splitlines(), out.splitlines()
+        if (before[:2] != after[:2]
+                or [r.split('|')[2:] for r in before[2:]]
+                != [r.split('|')[2:] for r in after[2:]]
+                or "| [person-1] " not in after[3]
+                or "| [person-1] " not in after[6]
+                or before[7:] != after[7:]
+                or out != red.redact_anchored_table_cells(out)):
+            failures.append(f"table header {header!r}: changed non-name content")
+    for table in (
+        "| Produktname | Tarif |\n|---|---|\n| Standard | Premium |",
+        "| Name | Standard | Premium |",  # no column header separator
+    ):
+        red = Redactor(None, [], threshold)
+        if red.redact_anchored_table_cells(table) != table:
+            failures.append("table name anchoring: matched outside a name column")
 
     labels = labels_for(strict)
     for lang, case in SELFTEST_CASES.items():

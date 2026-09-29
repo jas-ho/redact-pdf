@@ -9,7 +9,7 @@ Built for contracts, insurance papers, tax and bank letters in German and Englis
 1. Docling converts the PDF into a structured document (text items and table cells).
 2. Every text item and table cell goes through two detectors on the original text: regex patterns for structured IDs (IBAN, BIC, VAT, tax and social-security numbers, labeled customer/contract/account numbers, emails, phones, DOB after a "born"/"geb." anchor, maiden names after "née"/"geb.") and GLiNER (`urchade/gliner_multi_pii-v1`) for names, addresses, cities and other free-form PII.
 3. Overlapping spans are split rather than dropped, then replaced end to start.
-4. The rendered Markdown gets a post-pass: regex patterns again (catches IDs in links Docling synthesizes), DOB values in table cells whose label sits in another cell or in the column header, and a **recurrence sweep** that replaces every later literal occurrence of an already-found entity, including bare or upper-cased compound surnames of a titled person.
+4. The rendered Markdown gets a post-pass: regex patterns again (catches IDs in links Docling synthesizes), DOB values in table cells whose label sits in another cell or in the column header, names under recognized DE/EN/FR/ES column headers, and a **recurrence sweep** that replaces every later literal occurrence of an already-found entity, including bare or upper-cased compound surnames of a titled person.
 5. PDF metadata (Author, Title, Subject, Keywords) is redacted too and emitted as YAML front matter, with a warning when it held PII.
 6. Output: `<stem>.md` (0644) next to the PDF, plus a hidden sidecar `.<stem>.entity_map.json` (0600) mapping each original surface to its placeholder, for re-identifying an LLM's answer later.
 
@@ -48,7 +48,7 @@ Default mode keeps organization names, countries, URLs, BIC and VAT IDs visible,
 ./redact-pdf --selftest --strict   # strict mode
 ```
 
-Feeds fictional DE, EN, FR and ES samples plus German edge-case, unlabeled-ID and table samples as strings through the redaction stages (per-item redaction, regex post-pass, table DOB anchoring, name aliasing, recurrence sweep) and checks must-redact and must-keep lists (dates that are not DOBs, amounts, "Kontoauszug", role nouns, tariff names). It does not exercise Docling conversion, per-cell table processing, metadata or file writes; `examples/sample-contract.pdf` covers those by eye. Exit code 5 on failure. Documented leaks print as `KNOWN LEAK` warnings without failing the run.
+Feeds fictional DE, EN, FR and ES samples plus German edge-case, unlabeled-ID and table samples as strings through the redaction stages (per-item redaction, regex post-pass, table DOB/name anchoring, name aliasing, recurrence sweep) and checks must-redact and must-keep lists (dates that are not DOBs, amounts, "Kontoauszug", role nouns, tariff names). Model-independent checks also cover multilingual name headers, partial placeholders and short names. It does not exercise Docling conversion, per-cell table processing, metadata or file writes; `examples/sample-contract.pdf` covers those by eye. Exit code 5 on failure. Documented leaks print as `KNOWN LEAK` warnings without failing the run.
 
 Both modes pass with the pinned GLiNER revision (`GLINER_REVISION` in the script) and the dependency versions locked in `redact-pdf.lock`, which `uv run --script` picks up automatically. One run takes about 40 s on an Apple M3 laptop after the first download.
 
@@ -71,7 +71,7 @@ Visible in the example output:
 - A bare keyword can become a placeholder (the word "IBAN" in front of an IBAN). Cosmetic, no leak.
 - Postcodes and flat numbers can survive: `1234` and `Top 4` stay visible next to a redacted street and city.
 - A labeled ID needs its label directly before it ("Kundennummer: X" works, "Kundennummer der Hausverwaltung: X" does not).
-- Names inside table cells depend on GLiNER alone; in the selftest's table sample the shared surname survives in both rows and one first name survives in default mode (reported as `KNOWN LEAK` lines). Review tables by eye.
+- Names under recognized DE/EN/FR/ES table headers (e.g. "Vorname", "Versicherte Personen", "Surname", "Prénom", "Apellido") are redacted without relying on GLiNER. Tables with missing or unrecognized headers, or without a Markdown header separator, still rely on GLiNER and recurrence matching and can leak names. Generic "Name" columns can also contain non-person text that gets redacted. Review tables by eye.
 
 General:
 

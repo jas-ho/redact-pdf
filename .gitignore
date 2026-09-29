@@ -1,2 +1,6 @@
 __pycache__/
 .DS_Store
+
+# Entity-map sidecars hold the original PII; only the fictional example is tracked
+.*.entity_map.json
+!examples/.sample-contract.entity_map.json
