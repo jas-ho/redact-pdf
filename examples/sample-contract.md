@@ -13,7 +13,7 @@ Die Wohnung Top 4 im Haus [street\_address-1] wird ab 01.05.2026 vermietet. Die 
 
 ## 2. Zahlung
 
-Die Miete ist auf das Konto der Vermieterin zu überweisen: IBAN [iban-1], BIC TESTAT22XXX. Die Hausverwaltung TestVerwaltung GmbH (UID: ATU99999999, www.testverwaltung. example) erhält eine Kopie.
+Die Miete ist auf das Konto der Vermieterin zu überweisen: [iban-2][iban-1], BIC TESTAT22XXX. Die Hausverwaltung TestVerwaltung GmbH (UID: ATU99999999, www.testverwaltung. example) erhält eine Kopie.
 
 ## 3. Personen im Haushalt
 

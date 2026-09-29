@@ -333,8 +333,11 @@ ACCOUNT_ANCHORS = (
     r"ap[óo]lice)"
 )
 
-# Field labels are context, not values. Reuse the multilingual ID/DOB
-# anchors and detector labels so this guard also covers overlap fragments.
+# Recognized prefixes may be preserved only before an accepted value-like
+# remainder. A field word alone is never grounds for rejecting a detection.
+# Field words that are also first names or surnames.
+NAME_LIKE_FIELD_WORDS = {"iban", "swift", "born"}
+
 FIELD_LABEL_RE = re.compile(
     rf"(?:{ACCOUNT_ANCHORS}|{DOB_ANCHORS}|"
     + "|".join(re.escape(label) for label in LABELS_CORE + LABELS_STRICT_EXTRA)
@@ -347,13 +350,10 @@ FIELD_PREFIX_RE = re.compile(
     rf"^(?:{FIELD_LABEL_RE.pattern})(?!\w)\.?(?:\s*[:;#]\s*|\s+)",
     re.IGNORECASE,
 )
-FIELD_EXPLICIT_PREFIX_RE = re.compile(
-    rf"^(?:{FIELD_LABEL_RE.pattern})(?!\w)\.?\s*[:;#]\s*", re.IGNORECASE,
-)
-# Words such as Swift/Born and Tel (Aviv) can be real names or places.
-# For these detector types, require an explicit field separator.
+# Never preserve prefixes from name/place/address detections.
 NAME_PLACE_LABELS = {"person", "company", "organization", "city", "country",
-                     "street address", "full address"}
+                     "street address", "full address", "name", "full name",
+                     "first name", "last name", "surname"}
 
 PERSON_TITLE_RE = re.compile(
     r"^(?:(?:Dr|Mr|Mrs|Ms|Prof(?:essor)?|Sr|Sra|"
@@ -370,7 +370,26 @@ PERSON_SUFFIX_RE = re.compile(
 
 def person_name(surface: str) -> str:
     """Canonical spelling without leading salutations/titles."""
-    return PERSON_TITLE_RE.sub("", normalize(surface)).strip(" .,;:()")
+    cleaned = normalize(surface)
+    # Role prefixes affect identity/alias matching only. Redaction still
+    # covers the entire detected span, including these words.
+    while match := re.match(r"^(\S+?)\s*[:;,]\s*|^(\S+?)\s+", cleaned):
+        word = (match.group(1) or match.group(2)).strip(".,;:")
+        if word.lower() not in ROLE_NOUNS:
+            break
+        cleaned = cleaned[match.end():]
+    cleaned = PERSON_TITLE_RE.sub("", cleaned)
+    # M. can be a French title or a first initial. Strip it only before a
+    # full name; qualifications and parenthesized roles aren't name tokens.
+    french = re.match(r"^M\.?\s+(.+)$", cleaned)
+    if french:
+        candidate = PERSON_TITLE_RE.sub("", french.group(1))
+        tokens = re.sub(r"\([^)]*\)", "", candidate).split()
+        while tokens and PERSON_SUFFIX_RE.fullmatch(tokens[-1].strip(",;:")):
+            tokens.pop()
+        if len(tokens) >= 2:
+            cleaned = candidate
+    return cleaned.strip(" .,;:()")
 
 
 def surname_of(cleaned: str) -> str:
@@ -669,9 +688,6 @@ def reject_gliner_hit(label: str, surface: str) -> bool:
     surface = surface.strip()
     if not surface or len(surface) < MIN_SURFACE_LEN:
         return True
-    if ((label not in NAME_PLACE_LABELS or surface.endswith((":", ";", "#")))
-            and FIELD_LABEL_RE.fullmatch(surface.strip(" .:;#"))):
-        return True
     if surface.lower() in STOPWORDS:
         return True
     if PLACEHOLDER_RE.search(surface):
@@ -733,30 +749,6 @@ def reject_gliner_hit(label: str, surface: str) -> bool:
         if len(surface) >= 6:
             return True
     return False
-
-
-def trim_leading_role_prefix(text: str, start: int, end: int) -> Tuple[int, int]:
-    """Advance `start` past leading role-noun tokens followed by punctuation/
-    whitespace. Converts e.g. "Patient: Dr. Anna Beispiel" → "Dr. Anna
-    Beispiel", so the entity_map key is the actual name and `add_name_aliases`
-    can extract the surname properly.
-
-    Pure name spans (no leading role noun) are unaffected. Pure role phrases
-    like "Endnutzer oder Käufer" have no leading role-noun in ROLE_NOUNS so
-    nothing is trimmed; they remain as cosmetic placeholders without leaking.
-    """
-    while start < end:
-        rest = text[start:end]
-        # Either: word + optional whitespace + delimiter + optional whitespace,
-        # or: word + required whitespace (for delimiter-less "Patient Anna…").
-        m = re.match(r"^(\S+?)\s*[:;,]\s*|^(\S+?)\s+", rest)
-        if not m:
-            break
-        word = (m.group(1) or m.group(2) or "").strip(".,;:")
-        if word.lower() not in ROLE_NOUNS:
-            break
-        start += m.end()
-    return start, end
 
 
 # ── core redactor ─────────────────────────────────────────────────────────
@@ -841,15 +833,9 @@ class Redactor:
                 continue
             if start < 0 or end <= start or end > len(text):
                 continue
-            # GLiNER can include "IBAN " / "E-Mail: " in the value span.
-            # Trim before overlap resolution, preserving label punctuation
-            # and spacing even when the value has no regex detector.
+            # Keep field prefixes until after overlap resolution: trimming
+            # here changes length priority and can discard short PII pieces.
             label = e.get("label", "misc")
-            prefix_re = (FIELD_EXPLICIT_PREFIX_RE if label in NAME_PLACE_LABELS
-                         else FIELD_PREFIX_RE)
-            prefix = prefix_re.match(text[start:end])
-            if prefix:
-                start += prefix.end()
             surface = text[start:end]  # canonical, ignore e["text"]
             score = float(e.get("score") or 0.0)
             # Per-label score floor for labels that the model over-fires on
@@ -859,15 +845,6 @@ class Redactor:
                 continue
             if reject_gliner_hit(label, surface):
                 continue
-            # Trim leading role-noun prefix from person/company/organization
-            # spans so labeled forms like "Patient: Dr. Anna Beispiel" yield
-            # an entity_map key of "Dr. Anna Beispiel": the surname can
-            # then be aliased via the title-prefix path.
-            if label in ("person", "company", "organization"):
-                t_start, t_end = trim_leading_role_prefix(text, start, end)
-                if t_end - t_start >= MIN_SURFACE_LEN:
-                    start, end = t_start, t_end
-                    surface = text[start:end]
             spans.append(Span(start, end, label, surface, "gliner", score))
         return spans
 
@@ -896,11 +873,8 @@ class Redactor:
                             next_pieces.append((k.end, e))
                 pieces = next_pieces
             for s, e in pieces:
-                if e - s < MIN_SURFACE_LEN:
-                    continue
-                # Build new span for the piece (surface may differ from original
-                # if it was split). Re-validate as a GLiNER-style hit.
-                # We re-use the original label/source/score.
+                # Every piece of an accepted detection remains covered,
+                # including short or label-looking overlap fragments.
                 kept.append(Span(s, e, span.label, "", span.source, span.score))
         # Surfaces will be re-sliced from the original text in `redact`.
         return kept
@@ -910,19 +884,39 @@ class Redactor:
         if not text:
             return text
         spans = self._collect_regex_spans(text) + self._collect_gliner_spans(text)
+        name_spans = [s for s in spans if s.label in NAME_PLACE_LABELS]
         spans = self._resolve_overlaps(spans)
         for span in sorted(spans, key=lambda s: -s.start):
-            surface = text[span.start:span.end]
+            start = span.start
+            surface = text[start:span.end]
             key = normalize(surface)
-            if not key or len(key) < MIN_SURFACE_LEN:
+            if not key:
                 continue
-            # Re-validate only GLiNER spans (regex spans went through
-            # reject_regex_match already). After span-splitting a GLiNER hit
-            # may have shrunk into something label-incompatible.
-            if span.source == "gliner" and reject_gliner_hit(span.label, key):
-                continue
+            if span.source == "gliner" and span.label not in NAME_PLACE_LABELS:
+                prefix = FIELD_PREFIX_RE.match(surface)
+                if prefix:
+                    trimmed = normalize(surface[prefix.end():])
+                    first_token = trimmed.split()[0] if trimmed else ""
+                    value_like = (any(c.isdigit() for c in first_token)
+                                  or re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",
+                                                  first_token) is not None)
+                    # Preserve competing name evidence even when that hit
+                    # lost overlap priority to a wider non-name detection.
+                    name_in_prefix = any(
+                        s.start < start + prefix.end() and s.end > start
+                        for s in name_spans
+                    )
+                    # Iban, Swift and Born are also names: trim them as a
+                    # label only when written as a label (upper case).
+                    word = prefix.group(0).strip(" \t.:;#")
+                    name_like = (word.casefold() in NAME_LIKE_FIELD_WORDS
+                                 and not word.isupper())
+                    if (value_like and not name_in_prefix and not name_like
+                            and not reject_gliner_hit(span.label, trimmed)):
+                        start += prefix.end()
+                        key = trimmed
             placeholder = self._placeholder_for(key, span.label)
-            text = text[:span.start] + placeholder + text[span.end:]
+            text = text[:start] + placeholder + text[span.end:]
         return text
 
     # backward-compat alias
@@ -1116,7 +1110,12 @@ class Redactor:
             last = surname_of(cleaned)
             is_compound = "-" in last and len(last) >= ALIAS_COMPOUND_MIN_LEN
             is_long_titled = (len(last) >= ALIAS_SINGLE_MIN_LEN
-                              and PERSON_TITLE_RE.match(normalize(surface)))
+                              and (cleaned != normalize(surface).strip(" .,;:()")
+                                   # Retain legacy Di/di alias coverage without
+                                   # stripping an Italian name particle from
+                                   # the person's canonical identity.
+                                   or (len(tokens) >= 3
+                                       and re.match(r"(?i)^di\.?\s+", normalize(surface)))))
             if not (is_compound or is_long_titled):
                 continue
             candidates = surnames[last.casefold()]
@@ -1780,6 +1779,142 @@ def run_selftest(
             return [{"start": 0, "end": len(text), "label": self.label,
                      "score": 1.0}]
 
+    class FixedSpanModel:
+        def __init__(self, spans):
+            self.spans = spans
+
+        def predict_entities(self, text, labels, threshold):
+            return [{"start": text.index(surface),
+                     "end": text.index(surface) + len(surface),
+                     "label": label, "score": 1.0}
+                    for surface, label in self.spans]
+
+    def finish(red, out):
+        out = red.apply_pre_patterns_only(out)
+        out = red.redact_anchored_table_cells(out)
+        red.add_name_aliases()
+        return red.sweep_recurrences(out)
+
+    # Adversarial label-trimming regressions. Check all visible characters,
+    # not just whole secrets: a partially exposed number/name is still a leak.
+    for surface, label in (
+        ("Geburtsdatum: 14-03-1985", "date of birth"),
+        ("DOB 1985-3-14", "date of birth"),
+        ("Geb.-Dat. 1985/03/14", "date of birth"),
+        ("Date of birth 14 03 1985", "date of birth"),
+        ("Kundennummer: 123.456", "bank account number"),
+        ("Vertragsnummer 12.345.678", "bank account number"),
+        ("Tel.: 512.123.456", "phone number"),
+        ("Tel. 123", "phone number"),
+        ("Konto 987", "bank account number"),
+        ("Tel. 12.03.2024", "phone number"),
+        ("Passport number X12", "passport number"),
+        ("Passport number: AB1", "passport number"),
+        ("Iban Petrov", "bank account number"),
+        ("Iban Petrov 0664 1234567", "phone number"),
+        ("Tel Aviv", "phone number"),
+        ("Email Anna", "email"),
+        ("Swift 0664 1234567", "phone number"),
+        ("Iban 0664 1234567", "phone number"),
+        ("Iban: 0664 1234567", "phone number"),
+        ("Born 1985 in Graz", "date of birth"),
+    ):
+        red = Redactor(WholeSpanModel(label), labels_for(strict), threshold,
+                       strict=strict)
+        out = finish(red, red.redact_chunk(surface))
+        if PLACEHOLDER_RE.sub("", out).strip():
+            failures.append(f"unsafe field trim {surface!r}: {out!r}")
+
+    for inp, spans, visible in (
+        ("Erreichbar unter Tel. 512.123.456 oder per Mail.",
+         [("Tel. 512.123.456", "phone number")],
+         "Erreichbar unter  oder per Mail."),
+        ("Tel. 555 1234 Wien",
+         [("Tel. 555 1234", "phone number"), ("1234 Wien", "city")], "Tel. "),
+        ("Kundennummer 98 7654 Graz",
+         [("Kundennummer 98 7654", "bank account number"), ("7654 Graz", "city")],
+         "Kundennummer "),
+        ("Passport number X1234567 Karl Huber",
+         [("Passport number X1234567", "passport number"),
+          ("567 Karl Huber", "person")], "Passport number "),
+        ("Contact Swift:", [("Swift:", "person")], "Contact "),
+        ("Contact Swift;", [("Swift;", "person")], "Contact "),
+        ("Contact Swift#", [("Swift#", "person")], "Contact "),
+        ("Kontonummer: 1234,56", [("Kontonummer: 1234,56", "bank account number")],
+         "Kontonummer: "),
+        ("Iban 0664 1234567",
+         [("Iban", "person"), ("Iban 0664 1234567", "phone number")], ""),
+        ("Swift: 0664 1234567",
+         [("Swift", "person"), ("Swift: 0664 1234567", "phone number")], ""),
+        ("IBAN: 0664 1234567",
+         [("IBAN", "city"), ("IBAN: 0664 1234567", "phone number")], ""),
+    ):
+        red = Redactor(FixedSpanModel(spans), labels_for(strict), threshold,
+                       strict=strict)
+        out = finish(red, red.redact_chunk(inp))
+        if PLACEHOLDER_RE.sub("", out) != visible:
+            failures.append(f"overlap/name-label regression {inp!r}: {out!r}")
+
+    # ROUND 2: field words can themselves be names, regardless of the
+    # model's chosen label. Separators do not make a name safe to expose.
+    for inp, spans, visible in (
+        ("Vorname: Iban", [("Iban", "IBAN")], "Vorname: "),
+        ("Iban überweist die Miete.", [("Iban", "IBAN")], " überweist die Miete."),
+        ("Petrov; Iban", [("Petrov", "person"), ("Iban", "IBAN")], "; "),
+        ("Swift; Taylor, geboren am 13.12.1989",
+         [("Swift; Taylor", "person")], ", geboren am "),
+        ("Swift: Taylor 0664 1234567",
+         [("Swift: Taylor 0664 1234567", "phone number")], ""),
+        ("Tel#anna@x.at", [("Tel#anna@x.at", "email")], ""),
+    ):
+        red = Redactor(FixedSpanModel(spans), labels_for(strict), threshold,
+                       strict=strict)
+        out = finish(red, red.redact_chunk(inp))
+        if PLACEHOLDER_RE.sub("", out) != visible:
+            failures.append(f"ROUND 2 regression {inp!r}: {out!r}")
+
+    for label in NAME_PLACE_LABELS:
+        for surface in ("Swift; Taylor", "City: 1010 Wien", "IBAN AT00",
+                        "Patient: Dr. Anna Beispiel"):
+            red = Redactor(WholeSpanModel(label), [label], threshold)
+            out = red.redact_chunk(surface)
+            if not PLACEHOLDER_RE.fullmatch(out):
+                failures.append(f"name-like span trimmed ({label}) {surface!r}: {out!r}")
+
+    for label in labels_for(True):
+        for surface in ("Iban", "Swift:", "Email", "Tel#"):
+            if reject_gliner_hit(label, surface):
+                failures.append(f"field word rejected ({label}) {surface!r}")
+
+    for surface, visible in (
+        ("Swift: Taylor", ""), ("Swift; Taylor 0664 1234567", ""),
+        ("Email: Anna 1234", ""), ("Email: @Anna", ""),
+        ("Passport number: X12", ""), ("Tel. 512.123.456", ""),
+        ("IBAN AT00", "IBAN "), ("Tel: 4711abc", "Tel: "),
+    ):
+        red = Redactor(WholeSpanModel("phone number"), [], threshold)
+        out = red.redact_chunk(surface)
+        if PLACEHOLDER_RE.sub("", out) != visible:
+            failures.append(f"value-token trim rule {surface!r}: {out!r}")
+
+    for surface, surname in (
+        ("M. Jean Dupontelle", "Dupontelle"),
+        ("Di Stefano Albertini", "Albertini"),
+        ("di Marco Rossellini", "Rossellini"),
+    ):
+        red = Redactor(WholeSpanModel("person"), ["person"], threshold,
+                       strict=strict)
+        first = red.redact_chunk(surface)
+        out = finish(red, first + " / " + surname)
+        if out != first + " / " + first:
+            failures.append(f"legacy title surname {surface!r}: {out!r}")
+    red = Redactor(WholeSpanModel("person"), ["person"], threshold, strict=strict)
+    outputs = [red.redact_chunk(s) for s in
+               ("M. Jean Dupontelle", "Jean Dupontelle", "Dupontelle")]
+    out = finish(red, " / ".join(outputs))
+    if len(set(PLACEHOLDER_RE.findall(out))) != 1 or "Dupontelle" in out:
+        failures.append(f"French title: person variants not unified: {out!r}")
+
     for surface, label in (("Born", "person"), ("Swift", "person"),
                            ("Iban", "person"), ("Tel Aviv", "city"),
                            ("company.example", "url")):
@@ -1800,20 +1935,14 @@ def run_selftest(
     ):
         red = Redactor(WholeSpanModel(label), labels_for(strict), threshold,
                        strict=strict)
-        for bare in (keyword, keyword.upper() + ":"):
-            if red.redact_chunk(bare) != bare:
-                failures.append(f"field label {bare!r}: bare keyword redacted")
         for separator in (" ", ": ", ":"):
             inp = keyword + separator + value
-            out = red.redact_chunk(inp)
-            red.add_name_aliases()
-            out = red.sweep_recurrences(out)
-            if (not out.startswith(keyword + separator + "[")
-                    or value in out or keyword in red.entity_map):
+            out = finish(red, red.redact_chunk(inp))
+            # Strong regex hits can split off a bare field label, which is
+            # now redacted too. Keeping it is optional; hiding the value isn't.
+            visible = PLACEHOLDER_RE.sub("", out).strip()
+            if visible not in ("", (keyword + separator).strip()):
                 failures.append(f"field label {inp!r}: got {out!r}")
-        # Even a label left over AFTER splitting must be rejected.
-        if not reject_gliner_hit(label, keyword + " "):
-            failures.append(f"field label fragment {keyword!r}: accepted")
 
     variants = [
         "Herrn Mag. Karl Probstmüller", "Karl Probstmüller",
@@ -1880,13 +2009,15 @@ def run_selftest(
         failures.append("title normalization stripped the name particle Di")
     if surname_of("Amartya Sen") != "Sen" or surname_of("Karl Jun Jr.") != "Jun":
         failures.append("surname normalization stripped a real surname")
-    red = Redactor(WholeSpanModel("person"), ["person"], threshold, strict=strict)
-    mentions = ("Karl Probstmüller", "M. Probstmüller", "Herr Probstmüller")
-    for surface in mentions:
-        red.redact_chunk(surface)
-    red.add_name_aliases()
-    if len({red.entity_map[s] for s in mentions}) != 3:
-        failures.append("ambiguous initial M.: merged distinct person mentions")
+    for suffix in ("", " BSc", " jun."):
+        red = Redactor(WholeSpanModel("person"), ["person"], threshold, strict=strict)
+        mentions = ("Karl Probstmüller", "M. Probstmüller" + suffix,
+                    "Herr Probstmüller")
+        for surface in mentions:
+            red.redact_chunk(surface)
+        red.add_name_aliases()
+        if len({red.entity_map[s] for s in mentions}) != 3:
+            failures.append(f"ambiguous initial M.{suffix}: merged distinct person mentions")
 
     for ambiguous in (False, True):
         red = Redactor(WholeSpanModel("person"), ["person"], threshold, strict=strict)
@@ -1986,27 +2117,15 @@ def run_selftest(
                 f"detect_language({why}) = {got!r}, expected {expect!r}"
             )
 
-    # Unit cases for trim_leading_role_prefix.
-    trim_cases = [
-        ("Patient: Dr. Anna Beispiel", "Dr. Anna Beispiel"),
-        ("Kunde: Maria Muster", "Maria Muster"),
-        # Codex follow-up P2: compact delimiters with/without spacing.
-        ("Patient:Dr. Anna Beispiel", "Dr. Anna Beispiel"),     # no space after :
-        ("Patient :Dr. Anna Beispiel", "Dr. Anna Beispiel"),    # space before :
-        ("Kunde,Maria Muster", "Maria Muster"),                 # no space after ,
-        # Normal name spans pass through unchanged.
-        ("Anna Beispiel", "Anna Beispiel"),
-        ("Dr. Anna Beispiel", "Dr. Anna Beispiel"),
-        # Pure role phrases without a leading single-word role noun.
-        ("Endnutzer oder Käufer", "Endnutzer oder Käufer"),
-    ]
-    for inp, expect in trim_cases:
-        s, e = trim_leading_role_prefix(inp, 0, len(inp))
-        got = inp[s:e]
-        if got != expect:
-            failures.append(
-                f"trim_leading_role_prefix({inp!r}) = {got!r}, expected {expect!r}"
-            )
+    # Role labels remain covered; canonical identity still joins name variants.
+    for surface in ("Patient: Dr. Anna Beispiel", "Patient:Dr. Anna Beispiel",
+                    "Patient :Dr. Anna Beispiel", "Kunde,Dr. Anna Beispiel"):
+        red = Redactor(WholeSpanModel("person"), ["person"], threshold)
+        first = red.redact_chunk(surface)
+        second = red.redact_chunk("Dr. Anna Beispiel")
+        out = finish(red, first + " / " + second + " / Beispiel")
+        if not PLACEHOLDER_RE.fullmatch(first) or out != " / ".join([first] * 3):
+            failures.append(f"role-prefixed name coverage/identity {surface!r}: {out!r}")
 
     # Unit case for sweep_recurrences: short (4-5 digit) numeric IDs found
     # once must be replaced at later bare occurrences too.
