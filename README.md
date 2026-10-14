@@ -8,8 +8,8 @@ Built for contracts, insurance papers, tax and bank letters in German and Englis
 
 ## What it does
 
-1. Docling converts the PDF into a structured document (text items and table cells).
-2. Every text item and table cell goes through two detectors on the original text: regex patterns for structured IDs (IBAN, BIC, VAT, tax and social-security numbers, labeled customer/contract/account numbers, emails, phones, DOB after a "born"/"geb." anchor, maiden names after "née"/"geb.") and GLiNER (`urchade/gliner_multi_pii-v1`) for names, addresses, cities and other free-form PII.
+1. Docling converts the PDF into a structured document (text items and table cells). Mojibake from the PDF's text layer ("HÃ¤matologie") is repaired first.
+2. Every text item and table cell goes through two detectors on the original text: regex patterns for structured IDs (IBAN, BIC, VAT, tax and social-security numbers, labeled customer/contract/account numbers, emails, phones, DOB after a "born"/"geb." anchor, maiden names after "née"/"geb.") and GLiNER (`urchade/gliner_multi_pii-v1`) for names, addresses, cities and other free-form PII. Long text goes to GLiNER in overlapping windows, because the model silently ignores everything past its input limit. A phone-shaped match is judged with its surrounding text: inside a run of dates and times (`24.05.17 08:40`) it is data, not a phone number, and so is a regex match inside a run of 0.x decimals, unless a phone label like "Tel." precedes it.
 3. Overlapping spans are split rather than dropped, then replaced end to start.
 4. The rendered Markdown gets a post-pass: regex patterns again (catches IDs in links Docling synthesizes), DOB values in table cells whose label sits in another cell or in the column header, names under recognized DE/EN/FR/ES column headers, and a **recurrence sweep** that replaces every later literal occurrence of an already-found entity, including bare or upper-cased compound surnames of a titled person.
 5. PDF metadata (Author, Title, Subject, Keywords) is redacted too and emitted as YAML front matter, with a warning when it held PII.
@@ -57,13 +57,15 @@ Progress lines contain only counts, stage names, page numbers and times: no docu
 ./redact-pdf --selftest --strict   # strict mode
 ```
 
-Feeds fictional DE, EN, FR and ES samples plus German edge-case, unlabeled-ID and table samples as strings through the redaction stages (per-item redaction, regex post-pass, table DOB/name anchoring, name aliasing, recurrence sweep) and checks must-redact and must-keep lists (dates that are not DOBs, amounts, "Kontoauszug", role nouns, tariff names). Model-independent checks also cover multilingual name headers, partial placeholders, short names, field-label preservation, title/case/whitespace name variants and ambiguous surnames in either mention order. It does not exercise Docling conversion, per-cell table processing, metadata or file writes; `examples/sample-contract.pdf` covers those by eye. Exit code 5 on failure. Documented leaks print as `KNOWN LEAK` warnings without failing the run.
+Feeds fictional DE, EN, FR and ES samples plus German edge-case (including lab-report dates, decimals and phone layouts next to them), unlabeled-ID, long-paragraph and table samples as strings through the redaction stages (per-item redaction, regex post-pass, table DOB/name anchoring, name aliasing, recurrence sweep) and checks must-redact and must-keep lists (dates that are not DOBs, amounts, "Kontoauszug", role nouns, tariff names). Model-independent checks also cover multilingual name headers, partial placeholders, short names, field-label preservation, title/case/whitespace name variants and ambiguous surnames in either mention order. It does not exercise Docling conversion, per-cell table processing, metadata or file writes; `examples/sample-contract.pdf` covers those by eye. Exit code 5 on failure. Documented leaks print as `KNOWN LEAK` warnings without failing the run.
 
 Both modes pass with the pinned GLiNER revision (`GLINER_REVISION` in the script) and the dependency versions locked in `redact-pdf.lock`, which `uv run --script` picks up automatically. One run takes about 40 s on an Apple M3 laptop after the first download.
 
 ## Example
 
 [`examples/sample-contract.pdf`](examples/sample-contract.pdf) is a fictional German tenancy agreement built from [`sample-contract.typ`](examples/sample-contract.typ) (`typst compile examples/sample-contract.typ`). Its redacted output and sidecar are committed next to it: [`sample-contract.md`](examples/sample-contract.md) and `examples/.sample-contract.entity_map.json`.
+
+[`examples/sample-lab.pdf`](examples/sample-lab.pdf) is a fictional cumulative lab report ([`sample-lab.typ`](examples/sample-lab.typ)): date/time column headers with two-digit years, reference ranges, decimals, a doctor's name and a phone number in the comments. In [`sample-lab.md`](examples/sample-lab.md) (sidecar `examples/.sample-lab.entity_map.json`) the name and number are placeholders while every date, range and value stays readable. The patient line exists only in the page header, which Docling drops.
 
 ## Languages
 
@@ -80,12 +82,15 @@ Visible in the example output:
 - Recognized field labels such as IBAN, BIC, Tel., E-Mail and Kundennummer may stay visible only when a non-name GLiNER span has an accepted remainder starting with a token containing a digit or an email address. Name, organization, place and address spans are never prefix-trimmed. Bare labels and label fragments left by overlapping detections can be over-redacted. BIC values are targeted by regex only in strict mode, but can still be redacted by GLiNER in default mode if it classifies them as personal PII.
 - Postcodes and flat numbers can survive: `1234` and `Top 4` stay visible next to a redacted street and city.
 - A labeled ID needs its label directly before it ("Kundennummer: X" works, "Kundennummer der Hausverwaltung: X" does not).
-- Date and time columns of lab reports (`24.05.17 08:40`, `0.0612 0.0533`) are not treated as phone numbers: a phone-shaped match is kept visible when the whole surrounding run is valid full dates and HH:MM times, or 0.x decimals it starts inside. A phone number written exactly like such a run with no phone label (Tel, Fax, Mobil, ...) shortly before it stays visible.
 - Names under recognized DE/EN/FR/ES table headers (e.g. "Vorname", "Versicherte Personen", "Surname", "Prénom", "Apellido") are redacted without relying on GLiNER. Tables with missing or unrecognized headers, or without a Markdown header separator, still rely on GLiNER and recurrence matching and can leak names. Generic "Name" columns can also contain non-person text that gets redacted. Review tables by eye.
 
 General:
 
 - NER is probabilistic. Treat the output as a strong first pass and skim it before sharing anything sensitive.
+- GLiNER can label a lone table cell such as a lab parameter ("Leukozyten") as a person or city, and the recurrence sweep then replaces it everywhere. `--keep TERM` exempts an exact term from GLiNER (regex hits, name-column cells and recurrences of entities found elsewhere are still redacted).
+- Date and time columns of lab reports (`24.05.17 08:40`, `0.0612 0.0533`) are not treated as phone numbers: a phone-shaped match is kept visible when the whole surrounding run is valid full dates and HH:MM times, or 0.x decimals it starts inside. A phone number written exactly like such a run with no phone label (Tel, Fax, Mobil, ...) shortly before it stays visible.
+- Page headers and footers are dropped by Docling, so text that only appears there (often the patient line of a lab report) is missing from the output rather than redacted.
+- Large documents are slow: an 85-page lab report (about 16,000 text items and table cells) takes about 20 minutes on an Apple M3 Max, 5 for Docling's conversion and 15 for redaction (GLiNER runs on the CPU).
 - The source PDF is untouched; `exiftool -all= file.pdf` strips its metadata.
 - The sidecar holds the original PII. Keep it out of synced folders and out of the LLM's context.
 

@@ -783,6 +783,14 @@ def looks_like_amount(s: str) -> bool:
 
 _YEAR_SUFFIX_RE = re.compile(r"\.(19|20)\d{2}\b")
 _DMY_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(?:\d{2}|\d{4})")
+_TIME_RE = re.compile(r"(?:[01]?\d|2[0-3]):[0-5]\d")
+_ZERO_DECIMAL_RE = re.compile(r"0[.,]\d+")
+_PHONE_LABEL_RE = re.compile(
+    r"(?i)\b(?:tel|telefon|telephone|phone|fax|mobil|mobile|handy|cell)\b")
+# Characters of context around a phone-shaped match: enough before it for a
+# "Tel.:"-style label, enough after it to finish a date or ":MM".
+PHONE_CONTEXT_BEFORE = 30
+PHONE_CONTEXT_AFTER = 8
 
 
 def is_date_run(surface: str) -> bool:
@@ -843,22 +851,13 @@ TIER_NOUNS = {
 }
 
 
-_ZERO_DECIMAL_RE = re.compile(r"0[.,]\d+")
-_TIME_RE = re.compile(r"(?:[01]?\d|2[0-3]):[0-5]\d")
-
-
-
-_PHONE_LABEL_RE = re.compile(
-    r"(?i)\b(?:tel|telefon|telephone|phone|fax|mobil|mobile|handy|cell)\b")
-
-
 def in_date_or_decimal_run(surface: str, before: str, after: str, *,
                            decimals: bool = True) -> bool:
     """Lab-report date headers and value columns, judged with context.
     A phone-shaped match can start or end inside a number
     ("24.[05.17 26.06.17 03].07.17", "10:[01 23.06.24]", "[04.07.17 08]:38"),
-    so rebuild the whole run from the adjoining digits (`before`/`after`:
-    up to 8 chars of context), then accept it only if it is
+    so rebuild the whole run from the adjoining digits in `before`/`after`
+    (PHONE_CONTEXT_BEFORE/AFTER chars), then accept it only if it is
       - full dates dd.mm.yy(yy) and HH:MM times, at least one date, or
       - all 0.x decimals, when it started inside one ("0.[0612 0.0533]").
     "1.0664 1234567", "1,0664 123.4567", "01.12.34 56:09:30" and
@@ -883,7 +882,7 @@ def in_date_or_decimal_run(surface: str, before: str, after: str, *,
 
 def reject_regex_match(label: str, surface: str, *, before: str = "",
                        after: str = "") -> bool:
-    """`before`/`after`: a few chars of context around the match."""
+    """`before`/`after`: context around the match, see in_date_or_decimal_run."""
     surface = surface.strip()
     if label == "phone_number":
         if in_date_or_decimal_run(surface, before, after):
@@ -1050,8 +1049,9 @@ class Redactor:
                         end -= 1
                 surface = text[start:end]
                 if not surface or reject_regex_match(
-                        label, surface, before=text[max(0, start - 30):start],
-                        after=text[end:end + 8]):
+                        label, surface,
+                        before=text[max(0, start - PHONE_CONTEXT_BEFORE):start],
+                        after=text[end:end + PHONE_CONTEXT_AFTER]):
                     continue
                 spans.append(Span(start, end, label, surface, "regex", 1.0))
         return spans
@@ -1125,8 +1125,8 @@ class Redactor:
             # Decimals are not exempted here: a model phone hit after "0."
             # is a phone ("Tel.: 0.6123456789").
             if label == "phone number" and in_date_or_decimal_run(
-                    surface, text[max(0, start - 30):start], text[end:end + 8],
-                    decimals=False):
+                    surface, text[max(0, start - PHONE_CONTEXT_BEFORE):start],
+                    text[end:end + PHONE_CONTEXT_AFTER], decimals=False):
                 continue
             spans.append(Span(start, end, label, surface, "gliner", score))
         return spans
@@ -2078,7 +2078,7 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
         "must_keep": ["unauffällig"],
     },
     # Number-dense text: GLiNER's splitter counts every "." and ":", so 127
-    # whitespace words can be 449 model tokens (codex P1 on word windows).
+    # whitespace words can be 449 model tokens.
     "LONGNUM": {
         "input": "09.10.24 08:40 0.0612 " * 40
                  + "Dr. Anna Probstmüller hat den Befund unterschrieben.",
@@ -2205,7 +2205,7 @@ def run_selftest(
             failures.append(f"unsafe field trim {surface!r}: {out!r}")
 
     # GLiNER phone hits: date-header fragments are dropped by context,
-    # real numbers are redacted completely (codex rounds 4-6 layouts).
+    # real phone layouts are redacted completely.
     for inp, frag, dropped in (
         ("12.07.17 18.08.17 07:38", "08.17 07", True),
         ("21.06.24 10:04 11.03.24", "10:04 11.03", True),
