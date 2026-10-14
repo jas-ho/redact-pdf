@@ -4,6 +4,7 @@
 # dependencies = [
 #   "docling>=2.0",
 #   "gliner>=0.2.13",
+#   "protobuf",
 #   "torch",
 #   "transformers",
 #   "typer>=0.12",
