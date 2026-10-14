@@ -117,7 +117,7 @@ import time
 import unicodedata
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
 # ── silence noisy imports BEFORE they happen ─────────────────────────────
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -151,6 +151,10 @@ MIN_SURFACE_LEN = 4
 GLINER_DEFAULT_MAX_LEN = 384
 GLINER_OVERLAP_TOKENS = 40
 GLINER_TOKEN_RE = re.compile(r"\w+(?:[-_]\w+)*|\S")
+# Windows per GLiNER forward pass (--batch-size), and batches per prefetch
+# step (progress granularity).
+NER_BATCH_SIZE = 16
+PREFETCH_CHUNK_BATCHES = 8
 MIN_PERSON_SURFACE = 4
 # Alias compound (hyphenated) surnames ≥ this length to existing placeholders.
 ALIAS_COMPOUND_MIN_LEN = 5
@@ -1006,14 +1010,19 @@ STRICT_ONLY_REGEX_LABELS = {"bic", "vat_id", "url"}
 
 class Redactor:
     def __init__(self, model, labels: List[str], threshold: float, *,
-                 strict: bool = False, keep: Tuple[str, ...] = ()):
+                 strict: bool = False, keep: Tuple[str, ...] = (),
+                 batch_size: int = NER_BATCH_SIZE):
         self.model = model
+        self.batch_size = batch_size
+        # GLiNER results per exact window text (window-relative offsets), so
+        # a window is predicted once per document; see prefetch().
+        self._ner_cache: Dict[str, List[dict]] = {}
         # --keep: exact whole-entity terms GLiNER may not redact (casefolded).
         # Overrides the model only: regex patterns, name-column cells and
         # recurrences of entities found elsewhere are still redacted.
         self.keep = {normalize(t).casefold() for t in keep}
         self.n_kept = 0
-        self.labels = labels
+        self.labels = list(labels)
         self.threshold = threshold
         self.strict = strict
         self.entity_map: Dict[str, str] = {}
@@ -1063,11 +1072,13 @@ class Redactor:
                 spans.append(Span(start, end, label, surface, "regex", 1.0))
         return spans
 
-    def _predict_windows(self, text: str) -> List[dict]:
+    def _windows(self, text: str) -> List[Tuple[int, int]]:
         """GLiNER silently truncates input beyond its max_len (384 tokens),
-        so a name late in a long paragraph was never seen. Predict over
-        overlapping word windows well under that limit and shift offsets
-        back to `text` coordinates."""
+        so a name late in a long paragraph was never seen. Split `text` into
+        overlapping windows well under that limit, as (start, end) offsets,
+        counted with GLiNER's own word splitter."""
+        if not text.strip():
+            return []
         splitter = getattr(getattr(self.model, "data_processor", None),
                            "words_splitter", None)
         if splitter is not None:
@@ -1081,16 +1092,59 @@ class Redactor:
         size = max(2 * GLINER_OVERLAP_TOKENS, max_len // 2)
         starts = range(0, max(1, len(tokens) - GLINER_OVERLAP_TOKENS),
                        size - GLINER_OVERLAP_TOKENS)
+        return [(tokens[i][0], tokens[min(i + size, len(tokens)) - 1][1])
+                for i in starts]
+
+    def _infer(self, windows: List[str]) -> None:
+        """Predict `windows` (window texts) and cache the results. Same
+        decoding as predict_entities (flat, single-label), batched."""
+        try:
+            if hasattr(self.model, "inference"):
+                results = self.model.inference(
+                    windows, self.labels, threshold=self.threshold,
+                    flat_ner=True, multi_label=False,
+                    batch_size=self.batch_size)
+            else:  # selftest stand-in models
+                results = [self.model.predict_entities(
+                    w, self.labels, threshold=self.threshold) for w in windows]
+        except Exception as exc:
+            raise RedactionError(f"GLiNER prediction failed: {exc}") from exc
+        if len(results) != len(windows):
+            raise RedactionError(
+                f"GLiNER returned {len(results)} results for {len(windows)} windows")
+        for window, ents in zip(windows, results):
+            self._ner_cache[window] = ents
+
+    def prefetch(self, texts: List[str],
+                 on_progress: Optional[Callable[[int], None]] = None) -> None:
+        """Predict every distinct window of `texts` in batches, so the
+        per-item redaction pass only reads the cache. Results and their order
+        of use are unchanged. `on_progress(n)`: the first n texts are ready."""
+        per_text = [[text[lo:hi] for lo, hi in self._windows(text)] for text in texts]
+        pending = list(dict.fromkeys(
+            w for windows in per_text for w in windows if w not in self._ner_cache))
+        ready = 0
+        chunk = self.batch_size * PREFETCH_CHUNK_BATCHES
+        for i in range(0, max(len(pending), 1), chunk):  # once if nothing pending
+            if pending[i:i + chunk]:
+                self._infer(pending[i:i + chunk])
+            while ready < len(per_text) and all(
+                    w in self._ner_cache for w in per_text[ready]):
+                ready += 1
+            if on_progress is not None:
+                on_progress(ready)
+
+    def _predict_windows(self, text: str) -> List[dict]:
+        """Entities for `text` from its windows, offsets in `text`
+        coordinates; windows missing from the cache are predicted now."""
+        windows = self._windows(text)
+        missing = list(dict.fromkeys(
+            text[lo:hi] for lo, hi in windows if text[lo:hi] not in self._ner_cache))
+        if missing:
+            self._infer(missing)
         best: Dict[tuple, dict] = {}
-        for i in starts:
-            chunk = tokens[i:i + size]
-            lo, hi = chunk[0][0], chunk[-1][1]
-            try:
-                found = self.model.predict_entities(
-                    text[lo:hi], self.labels, threshold=self.threshold)
-            except Exception as exc:
-                raise RedactionError(f"GLiNER prediction failed: {exc}") from exc
-            for e in found:
+        for lo, hi in windows:
+            for e in self._ner_cache[text[lo:hi]]:
                 if isinstance(e.get("start"), int) and isinstance(e.get("end"), int):
                     e = {**e, "start": e["start"] + lo, "end": e["end"] + lo}
                 # Same span from two windows: keep the higher score, so a
@@ -1863,7 +1917,7 @@ def process_pdf(
     pdf_path: Path, out_dir: Path, model, *, rename: str, threshold: float,
     json_mode: bool, force: bool, strict: bool = False, ocr: bool = False,
     progress: Optional[Progress] = None, keep: Tuple[str, ...] = (),
-    tables: bool = False, pdf: bool = False,
+    tables: bool = False, pdf: bool = False, batch_size: int = NER_BATCH_SIZE,
 ) -> dict:
     from docling_core.types.doc import TableItem, TextItem
     from ftfy import fix_encoding
@@ -1875,7 +1929,7 @@ def process_pdf(
     result = converter.convert(str(pdf_path))
     doc = result.document
     redactor = Redactor(model, labels_for(strict), threshold, strict=strict,
-                        keep=keep)
+                        keep=keep, batch_size=batch_size)
 
     def _table_cells(table):
         for row in table.data.table_cells:
@@ -1897,31 +1951,41 @@ def process_pdf(
         )
         prog.start_items(total, len(getattr(doc, "pages", None) or {}))
 
-    n_text = n_table = n_chars = n_done = 0
-    raw_text_parts: List[str] = []
+    # Pass 1: repair mojibake and collect every text in document order.
+    # fix_encoding repairs UTF-8-read-as-Latin-1 text from the PDF text layer
+    # ("HÃ¤matologie" → "Hämatologie"); other text comes back unchanged.
+    texts: List[str] = []
+    pages: List[Optional[int]] = []
     for item, _level in doc.iterate_items():
         if isinstance(item, TextItem):
-            # fix_encoding repairs UTF-8-read-as-Latin-1 mojibake from the
-            # PDF text layer ("HÃ¤matologie" → "Hämatologie"); text that is
-            # not mojibake comes back unchanged.
-            raw = fix_encoding(item.text or "")
-            item.text = raw
-            raw_text_parts.append(raw)
-            new = redactor.redact_chunk(raw)
-            if new != item.text:
-                item.text = new
-            n_text += 1
-            n_chars += len(item.text or "")
-            n_done += 1
-            prog.tick(n_done, _page(item))
+            item.text = fix_encoding(item.text or "")
+            texts.append(item.text)
+            pages.append(_page(item))
         elif isinstance(item, TableItem):
             page = _page(item)
             for cell in _table_cells(item):
                 cell.text = fix_encoding(cell.text)
-                raw_text_parts.append(cell.text)
+                texts.append(cell.text)
+                pages.append(page)
+    # All GLiNER work happens here, batched; the counter is exact (items
+    # whose windows are all predicted).
+    redactor.prefetch(texts, on_progress=lambda n: prog.tick(
+        n, pages[n - 1] if n else None))
+
+    # Pass 2: redact in document order, so placeholder numbering is
+    # unchanged; GLiNER results come from the prefetch cache.
+    n_text = n_table = n_chars = 0
+    raw_text_parts: List[str] = texts
+    for item, _level in doc.iterate_items():
+        if isinstance(item, TextItem):
+            new = redactor.redact_chunk(item.text)
+            if new != item.text:
+                item.text = new
+            n_text += 1
+            n_chars += len(item.text or "")
+        elif isinstance(item, TableItem):
+            for cell in _table_cells(item):
                 cell.text = redactor.redact_chunk(cell.text)
-                n_done += 1
-                prog.tick(n_done, page)
             n_table += 1
     prog.end_items()
     prog.stage(3)
@@ -2363,6 +2427,7 @@ SELFTEST_CASES: Dict[str, Dict[str, object]] = {
 
 def run_selftest(
     model, threshold: float, *, json_mode: bool = False, strict: bool = False,
+    batch_size: int = NER_BATCH_SIZE,
 ) -> None:
     """Run all samples as strings through the redaction stages:
     per-item redaction → pre-pattern post-pass → table DOB/name anchoring → name
@@ -2500,6 +2565,61 @@ def run_selftest(
     else:
         log("selftest", "pandoc/typst not on PATH: --pdf render check skipped",
             json_mode=json_mode, level="WARN")
+
+    # Prefetch (batched, cached GLiNER) must not change any result. A
+    # deterministic batched stand-in counts its calls.
+    class CountingModel:
+        def __init__(self, fail=False):
+            self.calls, self.fail = 0, fail
+
+        def inference(self, texts, labels, threshold, flat_ner, multi_label, batch_size):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("boom")
+            return [[{"start": m.start(), "end": m.end(), "label": "person", "score": 0.9}
+                     for m in re.finditer(r"Probstmüller", t)] for t in texts]
+
+    filler = "Der Befund ist unauffällig und wurde kontrolliert. " * 30
+    texts = ["", "   ", "Leukozyten", "Dr. Karl Probstmüller", filler + "Karl Probstmüller",
+             "Dr. Karl Probstmüller", filler + "Karl Probstmüller", "keine Namen hier",
+             "Probstmüller " + filler + " Probstmüller"]
+    direct = Redactor(CountingModel(), labels_for(strict), threshold, strict=strict)
+    want = [direct.redact_chunk(t) for t in texts]
+    model_b = CountingModel()
+    batched = Redactor(model_b, labels_for(strict), threshold, strict=strict, batch_size=2)
+    batched.prefetch(texts, on_progress=lambda n: None)
+    calls_after_prefetch = model_b.calls
+    got = [batched.redact_chunk(t) for t in texts]
+    if got != want or batched.entity_map != direct.entity_map:
+        failures.append(f"prefetch changed redaction: {got!r} vs {want!r}")
+    if model_b.calls != calls_after_prefetch:
+        failures.append("redaction after prefetch called GLiNER again")
+    # Progress across several prefetch steps (batch_size=1: one step per
+    # PREFETCH_CHUNK_BATCHES windows): after each step, exactly the leading
+    # texts whose windows are all predicted count as ready.
+    many_texts = [f"Wert {i} Probstmüller" for i in range(3 * PREFETCH_CHUNK_BATCHES)] + [""]
+    progress = []
+    Redactor(CountingModel(), labels_for(strict), threshold,
+             batch_size=1).prefetch(many_texts, on_progress=progress.append)
+    k = PREFETCH_CHUNK_BATCHES
+    if progress != [k, 2 * k, 3 * k + 1]:
+        failures.append(f"prefetch progress {progress!r}, expected {[k, 2 * k, 3 * k + 1]}")
+    try:
+        Redactor(CountingModel(fail=True), labels_for(strict), threshold).prefetch(["Probstmüller"])
+        failures.append("failed GLiNER batch did not raise")
+    except RedactionError:
+        pass
+
+    # Same check with the real model: batched inference on this device must
+    # give the same redaction as one window at a time.
+    sample_texts = [str(c["input"]) for c in SELFTEST_CASES.values()]
+    one = Redactor(model, labels_for(strict), threshold, strict=strict, batch_size=1)
+    many = Redactor(model, labels_for(strict), threshold, strict=strict,
+                    batch_size=batch_size)
+    many.prefetch(sample_texts)
+    if ([many.redact_chunk(t) for t in sample_texts] != [one.redact_chunk(t) for t in sample_texts]
+            or many.entity_map != one.entity_map):
+        failures.append("batched GLiNER inference changed redaction on the selftest samples")
 
     # Phone label beats every date exemption, also in the regex-only path.
     red = Redactor(FixedSpanModel([]), labels_for(strict), threshold, strict=strict)
@@ -2935,17 +3055,38 @@ def run_selftest(
 
 # ── parallel processing ───────────────────────────────────────────────────
 
+def resolve_device(choice: str) -> str:
+    """auto: CUDA, then Apple MPS, then CPU. An explicit device must exist."""
+    if choice == "cpu":
+        return "cpu"  # no torch.cuda probe: it can break forked workers
+    import torch
+    available = {"cuda": torch.cuda.is_available(),
+                 "mps": torch.backends.mps.is_available(), "cpu": True}
+    if choice == "auto":
+        return next(d for d in ("cuda", "mps", "cpu") if available[d])
+    if not available.get(choice, False):
+        raise typer.BadParameter(f"device '{choice}' is not available here",
+                                 param_hint="--device")
+    return choice
+
+
+def load_model(device: str):
+    from gliner import GLiNER
+    return GLiNER.from_pretrained(GLINER_MODEL, revision=GLINER_REVISION).to(device)
+
+
 def _worker_init() -> None:
-    """Worker bootstrap: load GLiNER once per process."""
-    global _WORKER_MODEL
-    from gliner import GLiNER  # noqa: PLW0603
-    _WORKER_MODEL = GLiNER.from_pretrained(GLINER_MODEL, revision=GLINER_REVISION)
+    """Worker bootstrap: load GLiNER once per process, on the CPU: several
+    processes sharing one accelerator would each hold a model copy, and CUDA
+    does not survive fork."""
+    global _WORKER_MODEL  # noqa: PLW0603
+    _WORKER_MODEL = load_model("cpu")
 
 
 def _worker_process(args: tuple) -> Tuple[str, Optional[dict], Optional[str]]:
     """Run process_pdf in a worker. Returns (input_path, result_dict, error_msg)."""
     (pdf_path, out_dir, rename, threshold, force, strict, ocr,
-     json_mode, file_no, n_files, show_progress, keep, tables, pdf) = args
+     json_mode, file_no, n_files, show_progress, keep, tables, pdf, batch_size) = args
     # Workers share stderr: never rewrite a line in place, plain lines only.
     prog = Progress(file_no, n_files, enabled=show_progress, json_mode=json_mode)
     try:
@@ -2954,6 +3095,7 @@ def _worker_process(args: tuple) -> Tuple[str, Optional[dict], Optional[str]]:
             rename=rename, threshold=threshold,
             json_mode=json_mode, force=force, strict=strict, ocr=ocr,
             progress=prog, keep=keep, tables=tables, pdf=pdf,
+            batch_size=batch_size,
         )
         return (str(pdf_path), res, None)
     except ExtraOutputError as e:
@@ -2968,17 +3110,21 @@ def _run_parallel(
     inputs: List[Tuple[int, Path]], out_dir: Path, *, rename: str,
     threshold: float, force: bool, strict: bool, ocr: bool, json_mode: bool,
     jobs: int, n_files: int, show_progress: bool, keep: Tuple[str, ...] = (),
-    tables: bool = False, pdf: bool = False,
+    tables: bool = False, pdf: bool = False, batch_size: int = NER_BATCH_SIZE,
 ) -> Tuple[List[dict], int]:
     import concurrent.futures as cf
     args_list = [
         (str(p), str(out_dir), rename, threshold, force, strict, ocr,
-         json_mode, file_no, n_files, show_progress, keep, tables, pdf)
+         json_mode, file_no, n_files, show_progress, keep, tables, pdf, batch_size)
         for file_no, p in inputs
     ]
     results: List[dict] = []
     failed = 0
-    with cf.ProcessPoolExecutor(max_workers=jobs, initializer=_worker_init) as ex:
+    import multiprocessing
+    # spawn, not fork: a CUDA-initialized parent (device probe, Docling) must
+    # not be forked (macOS already defaults to spawn).
+    with cf.ProcessPoolExecutor(max_workers=jobs, initializer=_worker_init,
+                                mp_context=multiprocessing.get_context("spawn")) as ex:
         for pdf_path, res, err in ex.map(_worker_process, args_list):
             name = Path(pdf_path).name
             if err is not None:
@@ -3052,6 +3198,16 @@ def main(
         help="Also write <stem>.redacted.pdf, re-rendered from the redacted "
              ".md (not the original layout). Needs pandoc and typst."
     ),
+    device: str = typer.Option(
+        "auto", "--device",
+        help="Where GLiNER runs: auto (CUDA, then Apple MPS, then CPU), cpu, "
+             "mps or cuda. Parallel workers (-j > 1) always use the CPU."
+    ),
+    batch_size: int = typer.Option(
+        NER_BATCH_SIZE, "--batch-size", min=1,
+        help="Text windows per GLiNER pass. Lower it if the GPU runs out of "
+             "memory; results do not depend on it."
+    ),
     jobs: int = typer.Option(
         1, "--jobs", "-j",
         help="Process N PDFs in parallel worker processes. Each worker loads "
@@ -3085,12 +3241,15 @@ def main(
             "(e.g. brew install pandoc typst).", json_mode=json_mode, level="ERROR")
         raise typer.Exit(code=2)
 
-    log("init", f"loading GLiNER ({GLINER_MODEL})…", json_mode=json_mode)
-    from gliner import GLiNER
-    model = GLiNER.from_pretrained(GLINER_MODEL, revision=GLINER_REVISION)
+    device = resolve_device(device)
+
+    def _load() -> object:
+        log("init", f"loading GLiNER ({GLINER_MODEL}) on {device}…", json_mode=json_mode)
+        return load_model(device)
 
     if selftest:
-        run_selftest(model, threshold, json_mode=json_mode, strict=strict)
+        run_selftest(_load(), threshold, json_mode=json_mode, strict=strict,
+                     batch_size=batch_size)
         raise typer.Exit(code=0)
 
     if not inputs:
@@ -3119,6 +3278,10 @@ def main(
         warn_if_cloud_synced(d, json_mode=json_mode)
 
     use_parallel = jobs > 1 and len(valid_inputs) > 1
+    if use_parallel and device != "cpu":
+        log("init", f"parallel workers run GLiNER on the CPU, not {device}; "
+            "use -j 1 for the accelerator.", json_mode=json_mode)
+    model = None if use_parallel else _load()
     results: List[dict] = []
     if use_parallel:
         log("init", f"parallel mode: {jobs} workers across {len(valid_inputs)} files",
@@ -3135,6 +3298,7 @@ def main(
                 json_mode=json_mode, jobs=jobs,
                 n_files=len(inputs), show_progress=show_progress,
                 keep=tuple(keep), tables=tables, pdf=render_pdf,
+                batch_size=batch_size,
             )
             results.extend(sub)
             failed += n_fail
@@ -3148,7 +3312,7 @@ def main(
                     rename=rename, threshold=threshold,
                     json_mode=json_mode, force=force, strict=strict, ocr=ocr,
                     progress=prog, keep=tuple(keep), tables=tables,
-                    pdf=render_pdf,
+                    pdf=render_pdf, batch_size=batch_size,
                 )
                 results.append(res)
                 if json_mode:
