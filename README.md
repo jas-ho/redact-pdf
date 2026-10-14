@@ -37,6 +37,8 @@ Needs [uv](https://docs.astral.sh/uv/). The script is a single file with inline 
 ./redact-pdf offer.pdf --strict          # also redact company names, countries, URLs, BIC, VAT IDs
 ./redact-pdf scan.pdf --ocr              # scanned PDFs without a text layer (slow)
 ./redact-pdf lab.pdf --keep Leukozyten    # name detector may not redact this exact term (regex hits still are)
+./redact-pdf lab.pdf --tables             # + lab.tables.xlsx: each table of the .md as a sheet; plain decimal-point numbers as numbers (decimal commas, leading zeros, >15 digits stay text)
+./redact-pdf lab.pdf --pdf                # + lab.redacted.pdf, re-rendered from the .md (needs pandoc + typst)
 ./redact-pdf "Max Mustermann.pdf" --rename hash   # keep a name in the filename out of the output name
 ```
 
