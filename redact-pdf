@@ -114,6 +114,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager, nullcontext
 import unicodedata
 from enum import Enum
 from pathlib import Path
@@ -1702,16 +1703,52 @@ def warn_if_cloud_synced(out_dir: Path, *, json_mode: bool) -> None:
             return
 
 
-def _build_converter(ocr: bool):
+@contextmanager
+def _tableformer_allowed_on_mps():
+    """Docling moves TableFormer (its table-structure model) from MPS to the
+    CPU ("until we know why it makes things slower"). On an M3 Max it is 1.7x
+    faster on MPS, and TableFormer is ~99% of conversion time. While the
+    pipeline is built, make that MPS->CPU swap a no-op: the module uses the
+    enum only there. If the installed Docling no longer has the swap, this
+    does nothing."""
+    import inspect
+    import docling.models.stages.table_structure.table_structure_model as tsm
+    if "if device == AcceleratorDevice.MPS.value" not in inspect.getsource(tsm):
+        yield
+        return
+    real = tsm.AcceleratorDevice
+
+    class _NoMpsSwap:
+        CPU = real.CPU
+
+        class MPS:
+            value = object()  # never equal to a device string
+
+    tsm.AcceleratorDevice = _NoMpsSwap
+    try:
+        yield
+    finally:
+        tsm.AcceleratorDevice = real
+
+
+def _build_converter(ocr: bool, device: Optional[str] = None):
     """Build a Docling DocumentConverter. OCR off by default (text PDFs only);
-    enable with --ocr for scanned PDFs."""
+    enable with --ocr for scanned PDFs. `device`: None keeps Docling's own
+    choice (parallel workers); "cpu" forces every Docling model onto the CPU;
+    "mps" also lets TableFormer use MPS."""
     from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.accelerator_options import AcceleratorOptions
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
     opts = PdfPipelineOptions(do_ocr=ocr)
-    return DocumentConverter(format_options={
+    if device == "cpu":
+        opts.accelerator_options = AcceleratorOptions(device="cpu")
+    converter = DocumentConverter(format_options={
         InputFormat.PDF: PdfFormatOption(pipeline_options=opts)
     })
+    with (_tableformer_allowed_on_mps() if device == "mps" else nullcontext()):
+        converter.initialize_pipeline(InputFormat.PDF)
+    return converter
 
 
 class ExtraOutputError(Exception):
@@ -1918,6 +1955,7 @@ def process_pdf(
     json_mode: bool, force: bool, strict: bool = False, ocr: bool = False,
     progress: Optional[Progress] = None, keep: Tuple[str, ...] = (),
     tables: bool = False, pdf: bool = False, batch_size: int = NER_BATCH_SIZE,
+    device: Optional[str] = None,
 ) -> dict:
     from docling_core.types.doc import TableItem, TextItem
     from ftfy import fix_encoding
@@ -1925,7 +1963,7 @@ def process_pdf(
     prog = progress or Progress(1, 1, enabled=False)
     if prog.enabled:
         prog.stage(1, pages=pdf_page_count(pdf_path))
-    converter = _build_converter(ocr)
+    converter = _build_converter(ocr, device)
     result = converter.convert(str(pdf_path))
     doc = result.document
     redactor = Redactor(model, labels_for(strict), threshold, strict=strict,
@@ -3200,8 +3238,10 @@ def main(
     ),
     device: str = typer.Option(
         "auto", "--device",
-        help="Where GLiNER runs: auto (CUDA, then Apple MPS, then CPU), cpu, "
-             "mps or cuda. Parallel workers (-j > 1) always use the CPU."
+        help="Where the models run: auto (CUDA, then Apple MPS, then CPU), cpu, "
+             "mps or cuda. cpu puts Docling's models on the CPU too; mps also "
+             "runs Docling's table model on MPS. Parallel workers (-j > 1) "
+             "run GLiNER on the CPU and keep Docling's own device choice."
     ),
     batch_size: int = typer.Option(
         NER_BATCH_SIZE, "--batch-size", min=1,
@@ -3312,7 +3352,7 @@ def main(
                     rename=rename, threshold=threshold,
                     json_mode=json_mode, force=force, strict=strict, ocr=ocr,
                     progress=prog, keep=tuple(keep), tables=tables,
-                    pdf=render_pdf, batch_size=batch_size,
+                    pdf=render_pdf, batch_size=batch_size, device=device,
                 )
                 results.append(res)
                 if json_mode:
