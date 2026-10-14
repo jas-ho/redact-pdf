@@ -1,6 +1,6 @@
 // Fictional sample input for redact-pdf. Every name, number and address
 // below is invented; domains use the reserved .example TLD (RFC 2606).
-// Build: typst compile examples/sample-contract.typ
+// Build: typst compile examples/sample-contract.typ examples/sample-contract-input.pdf
 #set document(title: "Mietvertrag Beispiel", author: "Anna Beispiel")
 #set page(paper: "a4", margin: 2cm)
 #set text(lang: "de", size: 10.5pt)
