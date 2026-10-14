@@ -36,6 +36,7 @@ Needs [uv](https://docs.astral.sh/uv/). The script is a single file with inline 
 ./redact-pdf *.pdf -j 4 -o redacted/     # batch, 4 workers, explicit output dir
 ./redact-pdf offer.pdf --strict          # also redact company names, countries, URLs, BIC, VAT IDs
 ./redact-pdf scan.pdf --ocr              # scanned PDFs without a text layer (slow)
+./redact-pdf lab.pdf --keep Leukozyten    # name detector may not redact this exact term (regex hits still are)
 ./redact-pdf "Max Mustermann.pdf" --rename hash   # keep a name in the filename out of the output name
 ```
 
@@ -79,6 +80,7 @@ Visible in the example output:
 - Recognized field labels such as IBAN, BIC, Tel., E-Mail and Kundennummer may stay visible only when a non-name GLiNER span has an accepted remainder starting with a token containing a digit or an email address. Name, organization, place and address spans are never prefix-trimmed. Bare labels and label fragments left by overlapping detections can be over-redacted. BIC values are targeted by regex only in strict mode, but can still be redacted by GLiNER in default mode if it classifies them as personal PII.
 - Postcodes and flat numbers can survive: `1234` and `Top 4` stay visible next to a redacted street and city.
 - A labeled ID needs its label directly before it ("Kundennummer: X" works, "Kundennummer der Hausverwaltung: X" does not).
+- Date and time columns of lab reports (`24.05.17 08:40`, `0.0612 0.0533`) are not treated as phone numbers: a phone-shaped match is kept visible when the whole surrounding run is valid full dates and HH:MM times, or 0.x decimals it starts inside. A phone number written exactly like such a run with no phone label (Tel, Fax, Mobil, ...) shortly before it stays visible.
 - Names under recognized DE/EN/FR/ES table headers (e.g. "Vorname", "Versicherte Personen", "Surname", "Prénom", "Apellido") are redacted without relying on GLiNER. Tables with missing or unrecognized headers, or without a Markdown header separator, still rely on GLiNER and recurrence matching and can leak names. Generic "Name" columns can also contain non-person text that gets redacted. Review tables by eye.
 
 General:
