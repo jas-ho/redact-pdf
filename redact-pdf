@@ -4,6 +4,7 @@
 # dependencies = [
 #   "docling>=2.0",
 #   "ftfy>=6.0",
+#   "openpyxl>=3.1",
 #   "gliner>=0.2.13",
 #   "protobuf",
 #   "torch",
@@ -93,26 +94,30 @@ PROGRESS (stderr, on by default; --no-progress to silence)
 
 EXIT CODES
   0  all files ok
-  2  bad invocation (Typer default)
-  3  one or more files failed (incl. redaction errors: output suppressed)
+  2  bad invocation (Typer default; also --pdf without pandoc/typst)
+  3  one or more files failed (redaction errors: nothing written;
+     --tables/--pdf errors: .md and sidecar written, that output removed)
   4  no input files found
   5  selftest failure
 """
 from __future__ import annotations
 
 import hashlib
+import html
+import io
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import unicodedata
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 # ── silence noisy imports BEFORE they happen ─────────────────────────────
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -727,7 +732,7 @@ def file_content_hash(path: Path, length: int = 8) -> str:
     return h.hexdigest()[:length]
 
 
-def atomic_write(path: Path, data: str, *, mode: int = 0o644) -> None:
+def atomic_write(path: Path, data: Union[str, bytes], *, mode: int = 0o644) -> None:
     """Atomic write. Refuses to follow symlinks. Verifies target is a regular
     file after replace (defense against TOCTOU symlink-swap)."""
     if path.is_symlink():
@@ -735,7 +740,9 @@ def atomic_write(path: Path, data: str, *, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".redact-", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with os.fdopen(fd, "wb") as f:
             f.write(data)
         os.chmod(tmp, mode)
         os.replace(tmp, path)
@@ -1653,10 +1660,210 @@ def _build_converter(ocr: bool):
     })
 
 
+class ExtraOutputError(Exception):
+    """--tables / --pdf failed after the .md and sidecar were written."""
+
+
+# ── --tables: tables of the final redacted markdown → xlsx ──────────────
+
+_MD_SEPARATOR_ROW_RE = re.compile(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
+_MD_ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|<>~])")
+# Plain decimal-point numbers only: no leading zeros (IDs), at most 15
+# digits (Excel precision), no thousands separators or decimal commas
+# (ambiguous); everything else stays text.
+_XLSX_NUMBER_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?")
+XLSX_MAX_CELL = 32767  # Excel's cell limit; openpyxl truncates silently beyond it
+
+
+def markdown_tables(markdown: str) -> List[List[List[str]]]:
+    """Pipe tables of the redacted markdown as rows of cell strings. Built
+    from the final .md (not from Docling's table objects) so the workbook
+    holds exactly what the .md shows, after every redaction pass."""
+    tables: List[List[List[str]]] = []
+    current: List[List[str]] = []
+    header_seen = False
+    for line in markdown.splitlines() + [""]:
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            # The header separator is the block's second line; a body row
+            # of dashes is data.
+            if len(current) == 1 and not header_seen and _MD_SEPARATOR_ROW_RE.match(stripped):
+                header_seen = True
+                continue
+            body = stripped[1:-1] if stripped.endswith("|") and len(stripped) > 1 else stripped[1:]
+            cells = re.split(r"(?<!\\)\|", body)
+            current.append([html.unescape(_MD_ESCAPE_RE.sub(r"\1", c.strip()))
+                            for c in cells])
+        elif current:
+            tables.append(current)
+            current = []
+            header_seen = False
+    return tables
+
+
+def xlsx_cell_value(text: str):
+    """int/float for plain decimal-point numbers, else the text unchanged."""
+    t = text.strip()
+    if _XLSX_NUMBER_RE.fullmatch(t) and len(re.sub(r"\D", "", t)) <= 15:
+        return float(t) if "." in t else int(t)
+    return text
+
+
+def tables_xlsx_bytes(tables: List[List[List[str]]]) -> bytes:
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.remove(wb.active)
+    wb.properties.creator = ""
+    wb.properties.lastModifiedBy = ""
+    for i, rows in enumerate(tables, 1):
+        ws = wb.create_sheet(f"table_{i}")
+        for r, row in enumerate(rows, 1):
+            for c, text in enumerate(row, 1):
+                if len(text) > XLSX_MAX_CELL:
+                    raise ExtraOutputError(
+                        f"table {i} row {r}: cell longer than Excel's "
+                        f"{XLSX_MAX_CELL} characters")
+                value = xlsx_cell_value(text)
+                cell = ws.cell(row=r, column=c, value=value)
+                if isinstance(value, str):
+                    # Never a formula ("=…") or anything else Excel evaluates.
+                    cell.data_type = "s"
+    if not wb.sheetnames:
+        wb.create_sheet("no_tables")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ── --pdf: re-render the final redacted markdown ─────────────────────────
+
+# Read only what is plainly markdown: no raw typst/HTML/TeX passthrough, no
+# title blocks or YAML (they become PDF metadata), no figure images, and no
+# attribute syntax ({typst:…} properties on divs/spans/headers become code).
+PANDOC_READER = "-".join((
+    "markdown", "yaml_metadata_block", "pandoc_title_block", "raw_attribute",
+    "raw_html", "raw_tex", "implicit_figures", "fenced_divs", "bracketed_spans",
+    "native_divs", "native_spans", "table_attributes", "header_attributes",
+    "link_attributes", "fenced_code_attributes", "inline_code_attributes",
+))
+TYPST_PREAMBLE = (
+    "#set document(date: none)\n"
+    "#show figure: set block(breakable: true)\n"
+    "#set table(stroke: 0.4pt + luma(170), inset: 3pt)\n"
+    "#show table.cell.where(y: 0): strong\n"
+)
+
+
+def md_for_pandoc(markdown: str) -> str:
+    """Escape bracket pairs that are not links: a line starting with
+    "[phone_number-2]: 40" or "[SIS_C1]: …" is otherwise a link reference
+    definition and silently disappears from the output."""
+    return re.sub(r"(?<!\\)\[([^\]\n]*)\](?![(\[])", r"\\[\1\\]", markdown)
+
+
+def missing_pdf_tools() -> List[str]:
+    return [b for b in ("pandoc", "typst") if shutil.which(b) is None]
+
+
+def render_pdf_bytes(markdown: str, *, landscape: bool) -> bytes:
+    missing = missing_pdf_tools()
+    if missing:
+        raise ExtraOutputError(f"--pdf needs {' and '.join(missing)} on PATH")
+    work = tempfile.mkdtemp(prefix="redact-pdf-render-")
+    try:
+        typ = subprocess.run(
+            ["pandoc", "--sandbox", "-f", PANDOC_READER, "-t", "typst", "-s",
+             "-V", "papersize=a4", "-V", "margin.x=1.4cm",
+             "-V", "margin.y=1.4cm", "-V", "fontsize=8pt"],
+            input=md_for_pandoc(markdown), capture_output=True, text=True,
+            check=True, timeout=300,
+        ).stdout
+        # pandoc emits "- / text" in a cell, which typst reads as a term list.
+        typ = re.sub(r"(?m)((?:^|\[)[ \t]*[-+][ \t]+)/", r"\1\\/", typ)
+        page = "#set page(flipped: true)\n" if landscape else ""
+        Path(work, "doc.typ").write_text(TYPST_PREAMBLE + page + typ, encoding="utf-8")
+        subprocess.run(
+            ["typst", "compile", "--root", work, "doc.typ", "doc.pdf"],
+            cwd=work, capture_output=True, text=True, check=True, timeout=600,
+        )
+        return Path(work, "doc.pdf").read_bytes()
+    except subprocess.CalledProcessError as exc:
+        raise ExtraOutputError(
+            f"{exc.cmd[0]} failed: {(exc.stderr or '').strip()[:300]}") from exc
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def pdf_text(data: bytes) -> str:
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(data)
+    try:
+        return "\n".join(pdf[i].get_textpage().get_text_range()
+                         for i in range(len(pdf)))
+    finally:
+        pdf.close()
+
+
+def leaked_keys(text: str, redactor: "Redactor") -> int:
+    """Backstop, not proof: count entity_map originals (of at least
+    MIN_SURFACE_LEN chars, any case) still present in the rendered PDF's text
+    (count only, never the surfaces)."""
+    text = normalize(text)
+    n = 0
+    for key in redactor.entity_map:
+        if len(key) < MIN_SURFACE_LEN or PLACEHOLDER_RE.search(key):
+            continue
+        prefix = r"\b" if key[0].isalnum() else ""
+        suffix = r"\b" if key[-1].isalnum() else ""
+        if re.search(prefix + re.escape(normalize(key)) + suffix, text,
+                     re.IGNORECASE):
+            n += 1
+    return n
+
+
+def write_extra_outputs(markdown: str, redactor: "Redactor", doc, *,
+                        xlsx_path: Optional[Path], pdf_out: Optional[Path]) -> None:
+    """Write --tables / --pdf outputs; on failure remove every requested
+    output not written by this run, so an older run's file is never mistaken
+    for this one."""
+    target = None
+    written: List[Path] = []
+    try:
+        if xlsx_path is not None:
+            target = xlsx_path
+            atomic_write(xlsx_path, tables_xlsx_bytes(markdown_tables(markdown)))
+            written.append(xlsx_path)
+        if pdf_out is not None:
+            target = pdf_out
+            pages = list((getattr(doc, "pages", None) or {}).values())
+            landscape = bool(pages) and sum(
+                p.size.width > p.size.height for p in pages) > len(pages) / 2
+            data = render_pdf_bytes(markdown, landscape=landscape)
+            n = leaked_keys(pdf_text(data), redactor)
+            if n:
+                raise ExtraOutputError(
+                    f"{n} redacted value(s) visible in the rendered PDF")
+            atomic_write(pdf_out, data)
+    except Exception as exc:
+        problems = []
+        for stale in (xlsx_path, pdf_out):
+            if stale is None or stale in written:
+                continue
+            try:
+                if stale.exists() and not stale.is_symlink():
+                    stale.unlink()
+            except OSError as cleanup_exc:
+                problems.append(f"could not remove stale {stale}: {cleanup_exc}")
+        name = target.name if target is not None else "extra output"
+        extra = f" ({'; '.join(problems)})" if problems else ""
+        raise ExtraOutputError(f"{name} not written: {exc}{extra}") from exc
+
+
 def process_pdf(
     pdf_path: Path, out_dir: Path, model, *, rename: str, threshold: float,
     json_mode: bool, force: bool, strict: bool = False, ocr: bool = False,
     progress: Optional[Progress] = None, keep: Tuple[str, ...] = (),
+    tables: bool = False, pdf: bool = False,
 ) -> dict:
     from docling_core.types.doc import TableItem, TextItem
     from ftfy import fix_encoding
@@ -1763,10 +1970,21 @@ def process_pdf(
     # easy to move/delete alongside the .md. Permissions enforced at file
     # level (0600) since there's no shared dir to chmod.
     map_path = out_dir / f".{stem}.entity_map.json"
+    xlsx_path = out_dir / f"{stem}.tables.xlsx" if tables else None
+    pdf_out = out_dir / f"{stem}.redacted.pdf" if pdf else None
+    # Never write (or clean up) the input itself, even with --force:
+    # "x.redacted.pdf" with --rename x --pdf would otherwise overwrite it.
+    src = pdf_path.resolve()
+    for p in (md_path, map_path, xlsx_path, pdf_out):
+        if p is not None and (p.resolve() == src
+                              or (p.exists() and p.samefile(src))):
+            raise RedactionError(
+                f"output {p} would overwrite the input PDF. NEXT: use "
+                f"--rename <NAME> or --out-dir <DIR>.")
 
     if not force:
-        for p in (md_path, map_path):
-            if p.exists():
+        for p in (md_path, map_path, xlsx_path, pdf_out):
+            if p is not None and p.exists():
                 raise RedactionError(
                     f"output exists: {p}. NEXT: rerun with --force to overwrite, "
                     f"--rename <NAME> for a different stem, or remove the file."
@@ -1842,11 +2060,15 @@ def process_pdf(
         except OSError:
             pass
         raise
+    write_extra_outputs(markdown, redactor, doc, xlsx_path=xlsx_path,
+                        pdf_out=pdf_out)
 
     prog.done()
     return {
         "input": str(pdf_path),
         "output": str(md_path),
+        "tables_output": str(xlsx_path) if xlsx_path else None,
+        "pdf_output": str(pdf_out) if pdf_out else None,
         "entity_map": str(map_path),
         "n_entities": len(redactor.entity_map),
         "n_kept": redactor.n_kept,
@@ -2228,6 +2450,56 @@ def run_selftest(
         if not dropped and (re.sub(r"\D", "", PLACEHOLDER_RE.sub("", out))
                             not in re.sub(r"\D", "", inp.replace(frag, ""))):
             failures.append(f"phone {frag!r} not fully redacted: {out!r}")
+
+    # --tables: parse the redacted markdown, never evaluate cell text.
+    md = ("Text\n\n| Name | 24.05.17 08:40 | Wert |\n|---|---|---|\n"
+          "| [person-1] | 4.09 | =1+1 |\n| a\\|b | 00123 | 1,234 |\n"
+          "| --- | --- | --- |\n\nEnd\n")
+    tables = markdown_tables(md)
+    if tables != [[["Name", "24.05.17 08:40", "Wert"], ["[person-1]", "4.09", "=1+1"],
+                   ["a|b", "00123", "1,234"], ["---", "---", "---"]]]:
+        failures.append(f"markdown_tables parsed {tables!r}")
+    try:
+        tables_xlsx_bytes([[["x" * (XLSX_MAX_CELL + 1)]]])
+        failures.append("oversized xlsx cell was silently accepted")
+    except ExtraOutputError:
+        pass
+    from openpyxl import load_workbook
+    ws = load_workbook(io.BytesIO(tables_xlsx_bytes(tables))).worksheets[0]
+    got = [(c.value, c.data_type) for row in ws.iter_rows() for c in row]
+    if (got[4] != (4.09, "n") or got[5] != ("=1+1", "s")
+            or got[7] != ("00123", "s") or got[8] != ("1,234", "s")):
+        failures.append(f"xlsx cell typing wrong: {got!r}")
+
+    # --pdf: placeholders survive pandoc; raw typst and title blocks don't.
+    if md_for_pandoc("[phone_number-2]: 40 [link](x)") != "\\[phone_number-2\\]: 40 [link](x)":
+        failures.append("md_for_pandoc escaping wrong")
+    if shutil.which("pandoc") and shutil.which("typst"):
+        sample = ("% Secret Title\n% Jane Author\n\n[phone_number-2]: 40\n\n"
+                  "```{=typst}\n#text[RAWSENTINEL]\n```\n\n"
+                  "::: {typst:text:tracking=\"2pt\"}\n"
+                  "Div text\n:::\n\n[span]{typst:text:fill=\"red\"}\n\n"
+                  "| A | B |\n|---|---|\n| - / 100 Leuko | [person-1] |\n")
+        try:
+            data = render_pdf_bytes(sample, landscape=True)
+            text = pdf_text(data)
+            import pypdfium2 as pdfium
+            meta = pdfium.PdfDocument(data).get_metadata_dict()
+            if "[phone_number-2]" not in text or "[person-1]" not in text:
+                failures.append("rendered PDF lost placeholders")
+            if any(x in str(meta) for x in ("Jane Author", "Secret Title")):
+                failures.append(f"title block reached PDF metadata: {meta!r}")
+            if "RAWSENTINEL" in text and "#text" not in text:
+                failures.append("raw typst block was executed")
+            # Attribute syntax must stay literal text, never typst properties.
+            flat = text.replace("\n", " ")
+            if "typst:text:tracking" not in flat or "typst:text:fill" not in flat:
+                failures.append("typst attribute on a div/span was interpreted")
+        except ExtraOutputError as exc:
+            failures.append(f"render_pdf_bytes failed: {exc}")
+    else:
+        log("selftest", "pandoc/typst not on PATH: --pdf render check skipped",
+            json_mode=json_mode, level="WARN")
 
     # Phone label beats every date exemption, also in the regex-only path.
     red = Redactor(FixedSpanModel([]), labels_for(strict), threshold, strict=strict)
@@ -2673,7 +2945,7 @@ def _worker_init() -> None:
 def _worker_process(args: tuple) -> Tuple[str, Optional[dict], Optional[str]]:
     """Run process_pdf in a worker. Returns (input_path, result_dict, error_msg)."""
     (pdf_path, out_dir, rename, threshold, force, strict, ocr,
-     json_mode, file_no, n_files, show_progress, keep) = args
+     json_mode, file_no, n_files, show_progress, keep, tables, pdf) = args
     # Workers share stderr: never rewrite a line in place, plain lines only.
     prog = Progress(file_no, n_files, enabled=show_progress, json_mode=json_mode)
     try:
@@ -2681,9 +2953,11 @@ def _worker_process(args: tuple) -> Tuple[str, Optional[dict], Optional[str]]:
             Path(pdf_path), Path(out_dir), _WORKER_MODEL,
             rename=rename, threshold=threshold,
             json_mode=json_mode, force=force, strict=strict, ocr=ocr,
-            progress=prog, keep=keep,
+            progress=prog, keep=keep, tables=tables, pdf=pdf,
         )
         return (str(pdf_path), res, None)
+    except ExtraOutputError as e:
+        return (str(pdf_path), None, f"extra-output: {e}")
     except RedactionError as e:
         return (str(pdf_path), None, f"redaction: {e}")
     except Exception as e:
@@ -2694,11 +2968,12 @@ def _run_parallel(
     inputs: List[Tuple[int, Path]], out_dir: Path, *, rename: str,
     threshold: float, force: bool, strict: bool, ocr: bool, json_mode: bool,
     jobs: int, n_files: int, show_progress: bool, keep: Tuple[str, ...] = (),
+    tables: bool = False, pdf: bool = False,
 ) -> Tuple[List[dict], int]:
     import concurrent.futures as cf
     args_list = [
         (str(p), str(out_dir), rename, threshold, force, strict, ocr,
-         json_mode, file_no, n_files, show_progress, keep)
+         json_mode, file_no, n_files, show_progress, keep, tables, pdf)
         for file_no, p in inputs
     ]
     results: List[dict] = []
@@ -2707,9 +2982,13 @@ def _run_parallel(
         for pdf_path, res, err in ex.map(_worker_process, args_list):
             name = Path(pdf_path).name
             if err is not None:
-                log("redaction" if err.startswith("redaction") else "conversion",
-                    f"failed on {name}: {err}. Output NOT written.",
-                    json_mode=json_mode, level="ERROR")
+                if err.startswith("extra-output"):
+                    log("output", f"failed on {name}: {err}. The .md and "
+                        "sidecar were written.", json_mode=json_mode, level="ERROR")
+                else:
+                    log("redaction" if err.startswith("redaction") else "conversion",
+                        f"failed on {name}: {err}. Output NOT written.",
+                        json_mode=json_mode, level="ERROR")
                 failed += 1
                 continue
             assert res is not None
@@ -2763,6 +3042,16 @@ def main(
              "insensitive, whole entity; regex hits are still redacted). For "
              "lab parameters detected as names: --keep Leukozyten."
     ),
+    tables: bool = typer.Option(
+        False, "--tables",
+        help="Also write <stem>.tables.xlsx: every table of the redacted .md "
+             "as its own sheet; plain decimal-point numbers as numbers."
+    ),
+    render_pdf: bool = typer.Option(
+        False, "--pdf",
+        help="Also write <stem>.redacted.pdf, re-rendered from the redacted "
+             ".md (not the original layout). Needs pandoc and typst."
+    ),
     jobs: int = typer.Option(
         1, "--jobs", "-j",
         help="Process N PDFs in parallel worker processes. Each worker loads "
@@ -2789,6 +3078,12 @@ def main(
 ):
     if verbose:
         logging.getLogger().setLevel(logging.INFO)
+
+    # Fail before minutes of conversion and redaction, not after them.
+    if render_pdf and missing_pdf_tools():
+        log("input", f"--pdf needs {' and '.join(missing_pdf_tools())} on PATH "
+            "(e.g. brew install pandoc typst).", json_mode=json_mode, level="ERROR")
+        raise typer.Exit(code=2)
 
     log("init", f"loading GLiNER ({GLINER_MODEL})…", json_mode=json_mode)
     from gliner import GLiNER
@@ -2839,7 +3134,7 @@ def main(
                 force=force, strict=strict, ocr=ocr,
                 json_mode=json_mode, jobs=jobs,
                 n_files=len(inputs), show_progress=show_progress,
-                keep=tuple(keep),
+                keep=tuple(keep), tables=tables, pdf=render_pdf,
             )
             results.extend(sub)
             failed += n_fail
@@ -2852,7 +3147,8 @@ def main(
                     pdf, _out_dir_for(pdf), model,
                     rename=rename, threshold=threshold,
                     json_mode=json_mode, force=force, strict=strict, ocr=ocr,
-                    progress=prog, keep=tuple(keep),
+                    progress=prog, keep=tuple(keep), tables=tables,
+                    pdf=render_pdf,
                 )
                 results.append(res)
                 if json_mode:
@@ -2861,6 +3157,10 @@ def main(
                     log("output",
                         f"{res['output']} ({res['n_entities']} entities, "
                         f"{res['n_text_items']} text, {res['n_tables']} tables)")
+            except ExtraOutputError as e:
+                log("output", f"failed on {pdf.name}: {e}. The .md and "
+                    "sidecar were written.", json_mode=json_mode, level="ERROR")
+                failed += 1
             except RedactionError as e:
                 log("redaction", f"failed on {pdf.name}: {e} "
                     "Output NOT written (fail-closed).",

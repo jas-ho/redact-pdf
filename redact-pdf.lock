@@ -22,6 +22,7 @@ requirements = [
     { name = "docling", specifier = ">=2.0" },
     { name = "ftfy", specifier = ">=6.0" },
     { name = "gliner", specifier = ">=0.2.13" },
+    { name = "openpyxl", specifier = ">=3.1" },
     { name = "protobuf" },
     { name = "torch" },
     { name = "transformers" },
