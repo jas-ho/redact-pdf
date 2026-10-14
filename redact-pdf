@@ -79,12 +79,16 @@ PROGRESS (stderr, on by default; --no-progress to silence)
   Per file: `[1/3] converting PDF (N pages)`, `[2/3] redacting` with a
   done/total counter over text items + table cells (percent, page, elapsed,
   ETA), `[3/3] post-pass + writing output`, `done in …`. Rewritten in place
-  on a terminal; a plain line every 5 s when stderr is a pipe/file or with
-  -j; JSON objects (tag "progress") with --json. Stdout is unaffected.
-  PII-safe: progress lines contain ONLY counts, stage names, page numbers
-  and times. Files appear as `file i/N` (position among the arguments),
-  never by name or output stem, so an agent may read them. Other stderr
-  lines (WARN/ERROR, the final `output` line) can contain filenames.
+  on a terminal; a plain line every 5 s when stderr is a pipe/file or
+  parallel -j workers run; JSON objects (tag "progress") with --json.
+  Stdout is unaffected.
+  PII-safe: `progress` messages contain ONLY counts, stage names, page
+  numbers and times. Files appear as `file i/N` (position among the
+  arguments), never by name or output stem, so an agent may read them.
+  This covers the progress messages only: other stderr lines (WARN/ERROR,
+  the final `output` line, third-party library warnings) can contain
+  filenames, and on a terminal a library warning can land on the same
+  screen line as the in-place counter.
 
 EXIT CODES
   0  all files ok
@@ -558,10 +562,13 @@ def log(
         sys.stderr.write("\n")
         _progress_line_open = False
     if json_mode:
-        print(json.dumps({"level": level, "tag": tag, "msg": msg, **(fields or {})}),
-              file=sys.stderr)
+        line = json.dumps({"level": level, "tag": tag, "msg": msg, **(fields or {})})
     else:
-        print(f"{level}[{tag}]: {msg}", file=sys.stderr)
+        line = f"{level}[{tag}]: {msg}"
+    # One write per record: -j workers share stderr, and print() writes the
+    # body and newline separately, which can interleave into broken lines.
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
 
 
 # ── progress ──────────────────────────────────────────────────────────────
@@ -582,7 +589,7 @@ def fmt_secs(s: float) -> str:
     s = max(0.0, s)
     if s < 59.95:  # avoid "60.0s"
         return f"{s:.1f}s"
-    m, sec = divmod(int(s), 60)
+    m, sec = divmod(round(s), 60)
     if m < 60:
         return f"{m}m{sec:02d}s"
     h, m = divmod(m, 60)
@@ -616,11 +623,17 @@ class Progress:
             return
         if not _progress_line_open:
             self._width = 0
-        # Truncate below terminal width: a wrapped line can't be rewritten.
-        line = f"INFO[progress]: {text}"[:max(20, shutil.get_terminal_size().columns - 1)]
+        # Keep the whole write (text + padding) below the width of the
+        # terminal stderr is on: a wrapped line can't be rewritten.
+        try:
+            cols = os.get_terminal_size(sys.stderr.fileno()).columns
+        except (OSError, ValueError):
+            cols = shutil.get_terminal_size().columns
+        cols = max(1, cols - 1)
+        line = text[:cols]  # no INFO[progress] prefix: terminal-only, keeps it short
         # Pad over the previous line's tail instead of an ANSI erase, which
         # legacy Windows consoles print literally.
-        sys.stderr.write("\r" + line + " " * max(0, self._width - len(line)))
+        sys.stderr.write("\r" + line + " " * max(0, min(self._width, cols) - len(line)))
         sys.stderr.flush()
         self._width = len(line)
         _progress_line_open = True
@@ -629,8 +642,11 @@ class Progress:
               items: Optional[int] = None) -> None:
         if not self.enabled:
             return
+        if n == 1:
+            # Start the file clock here, after process_pdf's one-off imports.
+            self.t_file = time.monotonic()
         label = {1: "converting PDF", 2: "redacting", 3: "post-pass + writing output"}[n]
-        detail = (f" ({pages} pages)" if pages is not None
+        detail = (f" ({pages} page{'s' * (pages != 1)})" if pages is not None
                   else f" ({items} text items + table cells)" if items is not None
                   else "")
         elapsed = time.monotonic() - self.t_file
@@ -662,7 +678,7 @@ class Progress:
         page_s = f", page {page}/{self.n_pages}" if page is not None else ""
         eta_s = f", ETA ~{fmt_secs(eta)}" if eta is not None and elapsed >= 1 else ""
         self._emit(
-            f"[2/{len(self.STAGES)}] redacting: {done}/{self.total} items ({pct}%)"
+            f"[2/{len(self.STAGES)}] {done}/{self.total} items ({pct}%)"
             f"{page_s}, {fmt_secs(elapsed)} elapsed{eta_s}",
             {"stage": 2, "stages": len(self.STAGES), "stage_name": "redact",
              "done": done, "total": self.total, "page": page, "pages": self.n_pages,
@@ -2645,7 +2661,7 @@ def main(
     )
     log("summary", f"{ok}/{total} ok | "
         f"{sum(r['n_entities'] for r in results)} entities total | "
-        f"{out_summary}")
+        f"{out_summary}", json_mode=json_mode)
 
     if failed:
         raise typer.Exit(code=3)
