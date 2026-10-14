@@ -3,8 +3,8 @@ __pycache__/
 
 # Entity-map sidecars hold the original PII; only the fictional examples are tracked
 .*.entity_map.json
-!examples/.sample-contract.entity_map.json
-!examples/.sample-lab.entity_map.json
+!examples/.sample-contract-output.entity_map.json
+!examples/.sample-lab-output.entity_map.json
 
 # Local verification artifacts
 tmp/

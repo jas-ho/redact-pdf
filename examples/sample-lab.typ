@@ -2,7 +2,7 @@
 // number and value below is invented. It reproduces the layout that broke
 // earlier versions: date/time column headers with 2-digit years, reference
 // ranges, decimals, and a patient header repeated on every page.
-// Build: typst compile examples/sample-lab.typ
+// Build: typst compile examples/sample-lab.typ examples/sample-lab-input.pdf
 #set document(title: "Kumulativbefund Beispiel", author: "Dr. Karl Probstmüller")
 #set page(
   paper: "a4", margin: (x: 1.6cm, y: 2.2cm),

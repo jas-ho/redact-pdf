@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Regenerate docs/img/before-after.png: typst excerpt of examples/sample-contract.typ
-# (narrow page, intro + table only) beside the matching lines of examples/sample-contract.md.
+# (narrow page, intro + table only) beside the matching lines of examples/sample-contract-output.md.
 # The Markdown side is hand-copied into before-after.html; update it if the sample output changes.
 set -euo pipefail
 cd "$(dirname "$0")"; tmp=$(mktemp -d)
