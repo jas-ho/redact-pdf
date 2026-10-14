@@ -94,8 +94,9 @@ PROGRESS (stderr, on by default; --no-progress to silence)
 
 EXIT CODES
   0  all files ok
-  2  bad invocation (Typer default)
-  3  one or more files failed (incl. redaction errors: output suppressed)
+  2  bad invocation (Typer default; also --pdf without pandoc/typst)
+  3  one or more files failed (redaction errors: nothing written;
+     --tables/--pdf errors: .md and sidecar written, that output removed)
   4  no input files found
   5  selftest failure
 """
@@ -116,7 +117,7 @@ import time
 import unicodedata
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 # ── silence noisy imports BEFORE they happen ─────────────────────────────
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -731,7 +732,7 @@ def file_content_hash(path: Path, length: int = 8) -> str:
     return h.hexdigest()[:length]
 
 
-def atomic_write(path: Path, data, *, mode: int = 0o644) -> None:
+def atomic_write(path: Path, data: Union[str, bytes], *, mode: int = 0o644) -> None:
     """Atomic write. Refuses to follow symlinks. Verifies target is a regular
     file after replace (defense against TOCTOU symlink-swap)."""
     if path.is_symlink():
@@ -1671,9 +1672,7 @@ _MD_ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|<>~])")
 # digits (Excel precision), no thousands separators or decimal commas
 # (ambiguous); everything else stays text.
 _XLSX_NUMBER_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?")
-
-
-XLSX_MAX_CELL = 32767
+XLSX_MAX_CELL = 32767  # Excel's cell limit; openpyxl truncates silently beyond it
 
 
 def markdown_tables(markdown: str) -> List[List[List[str]]]:
@@ -1703,6 +1702,7 @@ def markdown_tables(markdown: str) -> List[List[List[str]]]:
 
 
 def xlsx_cell_value(text: str):
+    """int/float for plain decimal-point numbers, else the text unchanged."""
     t = text.strip()
     if _XLSX_NUMBER_RE.fullmatch(t) and len(re.sub(r"\D", "", t)) <= 15:
         return float(t) if "." in t else int(t)
@@ -1761,8 +1761,12 @@ def md_for_pandoc(markdown: str) -> str:
     return re.sub(r"(?<!\\)\[([^\]\n]*)\](?![(\[])", r"\\[\1\\]", markdown)
 
 
+def missing_pdf_tools() -> List[str]:
+    return [b for b in ("pandoc", "typst") if shutil.which(b) is None]
+
+
 def render_pdf_bytes(markdown: str, *, landscape: bool) -> bytes:
-    missing = [b for b in ("pandoc", "typst") if shutil.which(b) is None]
+    missing = missing_pdf_tools()
     if missing:
         raise ExtraOutputError(f"--pdf needs {' and '.join(missing)} on PATH")
     work = tempfile.mkdtemp(prefix="redact-pdf-render-")
@@ -3072,6 +3076,12 @@ def main(
 ):
     if verbose:
         logging.getLogger().setLevel(logging.INFO)
+
+    # Fail before minutes of conversion and redaction, not after them.
+    if render_pdf and missing_pdf_tools():
+        log("input", f"--pdf needs {' and '.join(missing_pdf_tools())} on PATH "
+            "(e.g. brew install pandoc typst).", json_mode=json_mode, level="ERROR")
+        raise typer.Exit(code=2)
 
     log("init", f"loading GLiNER ({GLINER_MODEL})…", json_mode=json_mode)
     from gliner import GLiNER

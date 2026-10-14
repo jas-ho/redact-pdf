@@ -13,7 +13,7 @@ Built for contracts, insurance papers, tax and bank letters in German and Englis
 3. Overlapping spans are split rather than dropped, then replaced end to start.
 4. The rendered Markdown gets a post-pass: regex patterns again (catches IDs in links Docling synthesizes), DOB values in table cells whose label sits in another cell or in the column header, names under recognized DE/EN/FR/ES column headers, and a **recurrence sweep** that replaces every later literal occurrence of an already-found entity, including bare or upper-cased compound surnames of a titled person.
 5. PDF metadata (Author, Title, Subject, Keywords) is redacted too and emitted as YAML front matter, with a warning when it held PII.
-6. Output: `<stem>.md` (0644) next to the PDF, plus a hidden sidecar `.<stem>.entity_map.json` (0600) mapping each original surface to its placeholder, for re-identifying an LLM's answer later.
+6. Output: `<stem>.md` (0644) next to the PDF, plus a hidden sidecar `.<stem>.entity_map.json` (0600) mapping each original surface to its placeholder, for re-identifying an LLM's answer later. Optionally `<stem>.tables.xlsx` (`--tables`) and `<stem>.redacted.pdf` (`--pdf`), both built from that final Markdown, so they never show more than the `.md` does.
 
 If NER fails on any chunk, the file is not written (fail closed).
 
@@ -37,7 +37,7 @@ Needs [uv](https://docs.astral.sh/uv/). The script is a single file with inline 
 ./redact-pdf offer.pdf --strict          # also redact company names, countries, URLs, BIC, VAT IDs
 ./redact-pdf scan.pdf --ocr              # scanned PDFs without a text layer (slow)
 ./redact-pdf lab.pdf --keep Leukozyten    # name detector may not redact this exact term (regex hits still are)
-./redact-pdf lab.pdf --tables             # + lab.tables.xlsx: each table of the .md as a sheet; plain decimal-point numbers as numbers (decimal commas, leading zeros, >15 digits stay text)
+./redact-pdf lab.pdf --tables             # + lab.tables.xlsx, one sheet per table (see "Lab reports")
 ./redact-pdf lab.pdf --pdf                # + lab.redacted.pdf, re-rendered from the .md (needs pandoc + typst)
 ./redact-pdf "Max Mustermann.pdf" --rename hash   # keep a name in the filename out of the output name
 ```
@@ -63,13 +63,24 @@ Feeds fictional DE, EN, FR and ES samples plus German edge-case (including lab-r
 
 Both modes pass with the pinned GLiNER revision (`GLINER_REVISION` in the script) and the dependency versions locked in `redact-pdf.lock`, which `uv run --script` picks up automatically. One run takes about 40 s on an Apple M3 laptop after the first download.
 
+## Lab reports: spreadsheet and PDF output
+
+Cumulative lab reports are mostly tables of dates, reference ranges and values, with a few names and phone numbers in between. redact-pdf keeps the data readable (dates, times and decimals are not mistaken for phone numbers) and can hand it on in two more shapes:
+
+- `--tables` writes `<stem>.tables.xlsx` with every table of the redacted Markdown on its own sheet, ready to plot. Plain decimal-point numbers (`4.41`, `0.0612`) become numeric cells; anything else stays text: flagged values (`* 2.56`), ranges, decimal commas, leading zeros (`00123`, often IDs) and numbers over 15 digits. Text cells are always stored as text, so a cell like `=1+1` is never evaluated.
+- `--pdf` writes `<stem>.redacted.pdf`, re-rendered from the redacted Markdown with [pandoc](https://pandoc.org) and [typst](https://typst.app) (`brew install pandoc typst`). It is a readable, printable report, not a copy of the original layout. The source PDF is never edited, because redacting text inside a PDF leaves too many places for it to survive (images, annotations, form fields, hidden text). The render reads plain Markdown only: raw Typst, title blocks and attribute syntax are switched off, so document text cannot execute code or set PDF metadata.
+
+![Page 1 of the fictional examples/sample-lab-input.pdf beside the same page of sample-lab-output.redacted.pdf: the doctor's name and phone number in the comment are placeholders, every date header, reference range and value is unchanged, and the patient line from the page header is gone because Docling drops page headers](docs/img/lab-before-after.png)
+
+`--pdf` checks for pandoc and typst before starting and exits with code 2 if one is missing, writing nothing. If either output fails later (say, typst cannot compile the document), the `.md` and sidecar are still written, the file counts as failed (exit code 3), and no stale output of the same name is left behind.
+
 ## Example
 
-Each example is a fictional input PDF built from a typst source, plus the outputs redact-pdf writes for it. Inputs end in `-input`, outputs in `-output`; regenerate them with `./redact-pdf examples/<name>-input.pdf --rename <name>-output --force`.
+Each example is a fictional input PDF built from a typst source, plus the outputs redact-pdf writes for it. Inputs end in `-input`, outputs in `-output`; regenerate them with `./redact-pdf examples/<name>-input.pdf --rename <name>-output --force` (for the lab example add `--tables --pdf`).
 
 [`examples/sample-contract-input.pdf`](examples/sample-contract-input.pdf) is a fictional German tenancy agreement built from [`sample-contract.typ`](examples/sample-contract.typ). Output: [`sample-contract-output.md`](examples/sample-contract-output.md) and its sidecar `examples/.sample-contract-output.entity_map.json`.
 
-[`examples/sample-lab-input.pdf`](examples/sample-lab-input.pdf) is a fictional cumulative lab report ([`sample-lab.typ`](examples/sample-lab.typ)): date/time column headers with two-digit years, reference ranges, decimals, a doctor's name and a phone number in the comments. In [`sample-lab-output.md`](examples/sample-lab-output.md) (sidecar `examples/.sample-lab-output.entity_map.json`) the name and number are placeholders while every date, range and value stays readable. The patient line exists only in the page header, which Docling drops.
+[`examples/sample-lab-input.pdf`](examples/sample-lab-input.pdf) is a fictional cumulative lab report ([`sample-lab.typ`](examples/sample-lab.typ)): date/time column headers with two-digit years, reference ranges, decimals, a doctor's name and a phone number in the comments. In [`sample-lab-output.md`](examples/sample-lab-output.md) (sidecar `examples/.sample-lab-output.entity_map.json`) the name and number are placeholders while every date, range and value stays readable. The patient line exists only in the page header, which Docling drops. [`sample-lab-output.tables.xlsx`](examples/sample-lab-output.tables.xlsx) and [`sample-lab-output.redacted.pdf`](examples/sample-lab-output.redacted.pdf) are its `--tables` and `--pdf` outputs.
 
 ## Languages
 
@@ -94,6 +105,8 @@ General:
 - GLiNER can label a lone table cell such as a lab parameter ("Leukozyten") as a person or city, and the recurrence sweep then replaces it everywhere. `--keep TERM` exempts an exact term from GLiNER (regex hits, name-column cells and recurrences of entities found elsewhere are still redacted).
 - Date and time columns of lab reports (`24.05.17 08:40`, `0.0612 0.0533`) are not treated as phone numbers: a phone-shaped match is kept visible when the whole surrounding run is valid full dates and HH:MM times, or 0.x decimals it starts inside. A phone number written exactly like such a run with no phone label (Tel, Fax, Mobil, ...) shortly before it stays visible. A match that is a single full date (`Tel. 12.03.2024`) is never treated as a phone, label or not; the phone regex also skips matches containing `.19xx` or `.20xx`.
 - Page headers and footers are dropped by Docling, so text that only appears there (often the patient line of a lab report) is missing from the output rather than redacted.
+- `--tables` sees only what Docling recognized as a table; its quality decides the sheets. A header cell spanning two lines arrives as one cell (`24.05.17 10:24`), and a table that continues on the next page usually becomes two sheets.
+- `--pdf` contains the text and tables of the `.md`, nothing else: no images, charts or logos, and not the original fonts, page breaks or layout.
 - Large documents are slow: an 85-page lab report (about 16,000 text items and table cells) takes about 20 minutes on an Apple M3 Max, 5 for Docling's conversion and 15 for redaction (GLiNER runs on the CPU).
 - The source PDF is untouched; `exiftool -all= file.pdf` strips its metadata.
 - The sidecar holds the original PII. Keep it out of synced folders and out of the LLM's context.
