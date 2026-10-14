@@ -1805,8 +1805,9 @@ def pdf_text(data: bytes) -> str:
 
 
 def leaked_keys(text: str, redactor: "Redactor") -> int:
-    """Backstop, not proof: count entity_map originals still present in the
-    rendered PDF's text (count only, never the surfaces)."""
+    """Backstop, not proof: count entity_map originals (of at least
+    MIN_SURFACE_LEN chars, any case) still present in the rendered PDF's text
+    (count only, never the surfaces)."""
     text = normalize(text)
     n = 0
     for key in redactor.entity_map:
@@ -1814,7 +1815,8 @@ def leaked_keys(text: str, redactor: "Redactor") -> int:
             continue
         prefix = r"\b" if key[0].isalnum() else ""
         suffix = r"\b" if key[-1].isalnum() else ""
-        if re.search(prefix + re.escape(normalize(key)) + suffix, text):
+        if re.search(prefix + re.escape(normalize(key)) + suffix, text,
+                     re.IGNORECASE):
             n += 1
     return n
 
