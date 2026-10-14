@@ -75,6 +75,17 @@ FILENAME PII
     --rename NAME        # explicit stem (single file only)
     --rename hash        # 8-char hash of file CONTENT (anonymous, deterministic)
 
+PROGRESS (stderr, on by default; --no-progress to silence)
+  Per file: `[1/3] converting PDF (N pages)`, `[2/3] redacting` with a
+  done/total counter over text items + table cells (percent, page, elapsed,
+  ETA), `[3/3] post-pass + writing output`, `done in …`. Rewritten in place
+  on a terminal; a plain line every 5 s when stderr is a pipe/file or with
+  -j; JSON objects (tag "progress") with --json. Stdout is unaffected.
+  PII-safe: progress lines contain ONLY counts, stage names, page numbers
+  and times. Files appear as `file i/N` (position among the arguments),
+  never by name or output stem, so an agent may read them. Other stderr
+  lines (WARN/ERROR, the final `output` line) can contain filenames.
+
 EXIT CODES
   0  all files ok
   2  bad invocation (Typer default)
@@ -89,8 +100,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import tempfile
+import time
 import unicodedata
 from enum import Enum
 from pathlib import Path
@@ -535,11 +548,152 @@ def slug(text: str, max_len: int = 60) -> str:
     return text[:max_len].rstrip("-") or "redacted"
 
 
-def log(tag: str, msg: str, *, json_mode: bool = False, level: str = "INFO") -> None:
+def log(
+    tag: str, msg: str, *, json_mode: bool = False, level: str = "INFO",
+    fields: Optional[dict] = None,
+) -> None:
+    global _progress_line_open
+    if _progress_line_open:
+        # Terminate an in-place progress line so this message starts clean.
+        sys.stderr.write("\n")
+        _progress_line_open = False
     if json_mode:
-        print(json.dumps({"level": level, "tag": tag, "msg": msg}), file=sys.stderr)
+        print(json.dumps({"level": level, "tag": tag, "msg": msg, **(fields or {})}),
+              file=sys.stderr)
     else:
         print(f"{level}[{tag}]: {msg}", file=sys.stderr)
+
+
+# ── progress ──────────────────────────────────────────────────────────────
+# PII guarantee: progress output is built ONLY from counts, fixed stage
+# names, page numbers and times. It never includes document text, entity
+# values, output stems or the input filename (which may itself hold a
+# patient name): a file is identified by its 1-based position among the
+# command-line inputs ("file 2/5"). Callers pass numbers, never strings,
+# so an agent can watch stderr progress without seeing PII. Other stderr
+# lines (WARN/ERROR, the final `output` line) can name files.
+
+PROGRESS_TTY_INTERVAL = 0.5    # s between in-place updates on a terminal
+PROGRESS_LINE_INTERVAL = 5.0   # s between plain lines (pipes, logs, agents, -j)
+_progress_line_open = False    # an in-place (\r) line is on screen, unterminated
+
+
+def fmt_secs(s: float) -> str:
+    s = max(0.0, s)
+    if s < 59.95:  # avoid "60.0s"
+        return f"{s:.1f}s"
+    m, sec = divmod(int(s), 60)
+    if m < 60:
+        return f"{m}m{sec:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+class Progress:
+    """Per-file progress on stderr: three stage lines plus a throttled
+    items counter during redaction. On a TTY the counter is one line
+    rewritten in place; otherwise (pipe, log file, agent, -j worker) it is
+    a plain line every PROGRESS_LINE_INTERVAL s. --json emits the same
+    events as JSON log lines with numeric fields."""
+
+    STAGES = ("convert", "redact", "post-pass")
+
+    def __init__(self, file_no: int, n_files: int, *, enabled: bool = True,
+                 json_mode: bool = False, inplace: bool = False) -> None:
+        self.file_no, self.n_files = file_no, n_files
+        self.enabled, self.json_mode = enabled, json_mode
+        self.inplace = inplace and not json_mode
+        self.interval = PROGRESS_TTY_INTERVAL if self.inplace else PROGRESS_LINE_INTERVAL
+        self.t_file = self.t_items = self.last = time.monotonic()
+        self.total = self.n_pages = self._width = 0
+
+    def _emit(self, msg: str, fields: dict, *, inplace: bool = False) -> None:
+        global _progress_line_open
+        text = f"file {self.file_no}/{self.n_files} {msg}"
+        if not inplace:
+            log("progress", text, json_mode=self.json_mode,
+                fields={"file": self.file_no, "files": self.n_files, **fields})
+            return
+        if not _progress_line_open:
+            self._width = 0
+        # Truncate below terminal width: a wrapped line can't be rewritten.
+        line = f"INFO[progress]: {text}"[:max(20, shutil.get_terminal_size().columns - 1)]
+        # Pad over the previous line's tail instead of an ANSI erase, which
+        # legacy Windows consoles print literally.
+        sys.stderr.write("\r" + line + " " * max(0, self._width - len(line)))
+        sys.stderr.flush()
+        self._width = len(line)
+        _progress_line_open = True
+
+    def stage(self, n: int, *, pages: Optional[int] = None,
+              items: Optional[int] = None) -> None:
+        if not self.enabled:
+            return
+        label = {1: "converting PDF", 2: "redacting", 3: "post-pass + writing output"}[n]
+        detail = (f" ({pages} pages)" if pages is not None
+                  else f" ({items} text items + table cells)" if items is not None
+                  else "")
+        elapsed = time.monotonic() - self.t_file
+        fields = {"stage": n, "stages": len(self.STAGES),
+                  "stage_name": self.STAGES[n - 1], "elapsed_s": round(elapsed, 1)}
+        if pages is not None:
+            fields["pages"] = pages
+        if items is not None:
+            fields["total"] = items
+        self._emit(f"[{n}/{len(self.STAGES)}] {label}{detail}... "
+                   f"({fmt_secs(elapsed)} elapsed)", fields)
+
+    def start_items(self, total: int, n_pages: int) -> None:
+        self.total, self.n_pages = total, n_pages
+        self.t_items = self.last = time.monotonic()
+        self.stage(2, items=total)
+
+    def tick(self, done: int, page: Optional[int]) -> None:
+        """Call once per redacted unit; cheap unless the interval elapsed."""
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if now - self.last < self.interval:
+            return
+        self.last = now
+        elapsed = now - self.t_items
+        pct = 100 * done // max(1, self.total)
+        eta = elapsed / done * (self.total - done) if done else None
+        page_s = f", page {page}/{self.n_pages}" if page is not None else ""
+        eta_s = f", ETA ~{fmt_secs(eta)}" if eta is not None and elapsed >= 1 else ""
+        self._emit(
+            f"[2/{len(self.STAGES)}] redacting: {done}/{self.total} items ({pct}%)"
+            f"{page_s}, {fmt_secs(elapsed)} elapsed{eta_s}",
+            {"stage": 2, "stages": len(self.STAGES), "stage_name": "redact",
+             "done": done, "total": self.total, "page": page, "pages": self.n_pages,
+             "elapsed_s": round(elapsed, 1),
+             "eta_s": round(eta, 1) if eta is not None else None},
+            inplace=self.inplace,
+        )
+
+    def end_items(self) -> None:
+        global _progress_line_open
+        if not self.enabled:
+            return
+        elapsed = time.monotonic() - self.t_items
+        # On a TTY, overwrite the counter with the summary, then end the line.
+        self._emit(f"[2/{len(self.STAGES)}] redacted {self.total} items "
+                   f"in {fmt_secs(elapsed)}",
+                   {"stage": 2, "stages": len(self.STAGES), "stage_name": "redact",
+                    "done": self.total, "total": self.total,
+                    "elapsed_s": round(elapsed, 1)},
+                   inplace=_progress_line_open)
+        if _progress_line_open:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+            _progress_line_open = False
+
+    def done(self) -> None:
+        if not self.enabled:
+            return
+        elapsed = time.monotonic() - self.t_file
+        self._emit(f"done in {fmt_secs(elapsed)}",
+                   {"stage_name": "done", "elapsed_s": round(elapsed, 1)})
 
 
 def file_content_hash(path: Path, length: int = 8) -> str:
@@ -1296,6 +1450,19 @@ def extract_pdf_metadata(pdf_path: Path) -> Dict[str, str]:
     }
 
 
+def pdf_page_count(pdf_path: Path) -> Optional[int]:
+    """Page count via pypdfium2 (cheap; no rendering), for the progress line."""
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        try:
+            return len(pdf)
+        finally:
+            pdf.close()
+    except Exception:
+        return None
+
+
 _CLOUD_SYNC_ROOTS = (
     "Dropbox",
     "OneDrive",
@@ -1356,15 +1523,39 @@ def _build_converter(ocr: bool):
 def process_pdf(
     pdf_path: Path, out_dir: Path, model, *, rename: str, threshold: float,
     json_mode: bool, force: bool, strict: bool = False, ocr: bool = False,
+    progress: Optional[Progress] = None,
 ) -> dict:
     from docling_core.types.doc import TableItem, TextItem
 
+    prog = progress or Progress(1, 1, enabled=False)
+    if prog.enabled:
+        prog.stage(1, pages=pdf_page_count(pdf_path))
     converter = _build_converter(ocr)
     result = converter.convert(str(pdf_path))
     doc = result.document
     redactor = Redactor(model, labels_for(strict), threshold, strict=strict)
 
-    n_text = n_table = n_chars = 0
+    def _table_cells(table):
+        for row in table.data.table_cells:
+            for cell in (row if isinstance(row, list) else [row]):
+                if hasattr(cell, "text") and cell.text:
+                    yield cell
+
+    def _page(item) -> Optional[int]:
+        prov = getattr(item, "prov", None)
+        return getattr(prov[0], "page_no", None) if prov else None
+
+    if prog.enabled:
+        # Pre-count units (text items + non-empty table cells) for the counter.
+        total = sum(
+            1 if isinstance(item, TextItem)
+            else sum(1 for _ in _table_cells(item)) if isinstance(item, TableItem)
+            else 0
+            for item, _level in doc.iterate_items()
+        )
+        prog.start_items(total, len(getattr(doc, "pages", None) or {}))
+
+    n_text = n_table = n_chars = n_done = 0
     raw_text_parts: List[str] = []
     for item, _level in doc.iterate_items():
         if isinstance(item, TextItem):
@@ -1375,14 +1566,18 @@ def process_pdf(
                 item.text = new
             n_text += 1
             n_chars += len(item.text or "")
+            n_done += 1
+            prog.tick(n_done, _page(item))
         elif isinstance(item, TableItem):
-            for row in item.data.table_cells:
-                cells = row if isinstance(row, list) else [row]
-                for cell in cells:
-                    if hasattr(cell, "text") and cell.text:
-                        raw_text_parts.append(cell.text)
-                        cell.text = redactor.redact_chunk(cell.text)
+            page = _page(item)
+            for cell in _table_cells(item):
+                raw_text_parts.append(cell.text)
+                cell.text = redactor.redact_chunk(cell.text)
+                n_done += 1
+                prog.tick(n_done, page)
             n_table += 1
+    prog.end_items()
+    prog.stage(3)
 
     # Language sanity check (stopword-based; zero new deps). WARN if the
     # detected dominant language is outside the validated/likely-OK set:
@@ -1508,6 +1703,7 @@ def process_pdf(
             pass
         raise
 
+    prog.done()
     return {
         "input": str(pdf_path),
         "output": str(md_path),
@@ -2247,12 +2443,16 @@ def _worker_init() -> None:
 
 def _worker_process(args: tuple) -> Tuple[str, Optional[dict], Optional[str]]:
     """Run process_pdf in a worker. Returns (input_path, result_dict, error_msg)."""
-    pdf_path, out_dir, rename, threshold, force, strict, ocr = args
+    (pdf_path, out_dir, rename, threshold, force, strict, ocr,
+     json_mode, file_no, n_files, show_progress) = args
+    # Workers share stderr: never rewrite a line in place, plain lines only.
+    prog = Progress(file_no, n_files, enabled=show_progress, json_mode=json_mode)
     try:
         res = process_pdf(
             Path(pdf_path), Path(out_dir), _WORKER_MODEL,
             rename=rename, threshold=threshold,
-            json_mode=False, force=force, strict=strict, ocr=ocr,
+            json_mode=json_mode, force=force, strict=strict, ocr=ocr,
+            progress=prog,
         )
         return (str(pdf_path), res, None)
     except RedactionError as e:
@@ -2262,13 +2462,15 @@ def _worker_process(args: tuple) -> Tuple[str, Optional[dict], Optional[str]]:
 
 
 def _run_parallel(
-    inputs: List[Path], out_dir: Path, *, rename: str, threshold: float,
-    force: bool, strict: bool, ocr: bool, json_mode: bool, jobs: int,
+    inputs: List[Tuple[int, Path]], out_dir: Path, *, rename: str,
+    threshold: float, force: bool, strict: bool, ocr: bool, json_mode: bool,
+    jobs: int, n_files: int, show_progress: bool,
 ) -> Tuple[List[dict], int]:
     import concurrent.futures as cf
     args_list = [
-        (str(p), str(out_dir), rename, threshold, force, strict, ocr)
-        for p in inputs
+        (str(p), str(out_dir), rename, threshold, force, strict, ocr,
+         json_mode, file_no, n_files, show_progress)
+        for file_no, p in inputs
     ]
     results: List[dict] = []
     failed = 0
@@ -2341,6 +2543,14 @@ def main(
     selftest: bool = typer.Option(
         False, "--selftest", help="Run a built-in correctness check and exit."
     ),
+    show_progress: bool = typer.Option(
+        True, "--progress/--no-progress",
+        help="Per-file stage and item-count progress on stderr (in-place "
+             "line on a terminal, a line every 5 s otherwise, JSON with "
+             "--json). Contains only counts, stage names, page numbers and "
+             "times, never document text, entities or filenames (files are "
+             "'file i/N' in argument order), so it is safe for an agent to read."
+    ),
 ):
     if verbose:
         logging.getLogger().setLevel(logging.INFO)
@@ -2359,13 +2569,15 @@ def main(
         raise typer.Exit(code=4)
 
     valid_inputs: List[Path] = []
+    file_nos: List[int] = []  # 1-based argument position: progress label, not the name
     failed = 0
-    for pdf in inputs:
+    for file_no, pdf in enumerate(inputs, 1):
         if not pdf.exists():
             log("input", f"not found: {pdf}", json_mode=json_mode, level="ERROR")
             failed += 1
         else:
             valid_inputs.append(pdf)
+            file_nos.append(file_no)
 
     # Resolve out_dir per PDF if --out-dir not given; otherwise share one dir.
     def _out_dir_for(pdf: Path) -> Path:
@@ -2382,25 +2594,29 @@ def main(
         log("init", f"parallel mode: {jobs} workers across {len(valid_inputs)} files",
             json_mode=json_mode)
         # Group by resolved out_dir so each batch shares one path arg.
-        groups: Dict[str, List[Path]] = {}
-        for p in valid_inputs:
-            groups.setdefault(str(_out_dir_for(p).resolve()), []).append(p)
+        groups: Dict[str, List[Tuple[int, Path]]] = {}
+        for file_no, p in zip(file_nos, valid_inputs):
+            groups.setdefault(str(_out_dir_for(p).resolve()), []).append((file_no, p))
         for d_str, files in groups.items():
             sub, n_fail = _run_parallel(
                 files, Path(d_str),
                 rename=rename, threshold=threshold,
                 force=force, strict=strict, ocr=ocr,
                 json_mode=json_mode, jobs=jobs,
+                n_files=len(inputs), show_progress=show_progress,
             )
             results.extend(sub)
             failed += n_fail
     else:
-        for pdf in valid_inputs:
+        for file_no, pdf in zip(file_nos, valid_inputs):
+            prog = Progress(file_no, len(inputs), enabled=show_progress,
+                            json_mode=json_mode, inplace=sys.stderr.isatty())
             try:
                 res = process_pdf(
                     pdf, _out_dir_for(pdf), model,
                     rename=rename, threshold=threshold,
                     json_mode=json_mode, force=force, strict=strict, ocr=ocr,
+                    progress=prog,
                 )
                 results.append(res)
                 if json_mode:
