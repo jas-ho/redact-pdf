@@ -111,6 +111,7 @@ General:
 - `--tables` sees only what Docling recognized as a table; its quality decides the sheets. A header cell spanning two lines arrives as one cell (`24.05.17 10:24`), and a table that continues on the next page usually becomes two sheets.
 - `--pdf` contains the text and tables of the `.md`, nothing else: no images, charts or logos, and not the original fonts, page breaks or layout.
 - Docling's conversion dominates the runtime: an 85-page lab report (about 16,000 text items and table cells) takes about 3 minutes on an Apple M3 Max, almost all of it table-structure recognition; redaction takes about 20 seconds on the GPU. Converting page ranges in parallel would be faster but is not done: Docling joins paragraphs and hyphenated words across pages, and splitting would break those joins, which can split a name in two. On the CPU (`--device cpu`, or a machine without a supported GPU) batching and the window cache still apply.
+- Memory and disk: redacting `examples/sample-lab-input.pdf` peaks at about 3.4 GB of RAM with `--device cpu` and 3.0 GB on MPS (Docling plus GLiNER). Under 1.5 GiB and 2.5 GB memory caps on a Linux server, runs were killed while loading the models. On Linux x86_64 the lock installs CUDA builds of torch and NVIDIA libraries even without a GPU: there the uv environment took about 6 GB, plus about 3.8 GB of uv cache.
 - The source PDF is untouched; `exiftool -all= file.pdf` strips its metadata.
 - The sidecar holds the original PII. Keep it out of synced folders and out of the LLM's context.
 
